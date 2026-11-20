@@ -1,0 +1,8 @@
+# ShellCheck configuration for the wgb repo.
+#
+# The test suite sources wgb as a library, so linting either file alone cannot see the
+# other side of the interface. external-sources lets shellcheck follow those sources,
+# and SCRIPTDIR makes the `# shellcheck source=` directives resolve relative to the
+# file being checked rather than to the caller's working directory.
+external-sources=true
+source-path=SCRIPTDIR

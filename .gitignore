@@ -1,0 +1,15 @@
+# Generated client profiles, QR codes and scratch output.
+# Everything here is produced by `wgb up`; nothing in it belongs in the repo - and it is key
+# material, so it must never be pushed.
+out/
+
+# Local scratch and editor/OS noise.
+*.tmp
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# A local environment file, if anyone keeps one (wgb never reads one itself).
+.env

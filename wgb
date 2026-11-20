@@ -1,0 +1,3109 @@
+#!/usr/bin/env bash
+#
+# wgb - bring up a WireGuard tunnel that drives a client's traffic through Burp Suite
+#       running on this machine. Built for on-site mobile app interception.
+#
+#   wgb up --dry-run     show exactly what would happen (no root, no changes)
+#   wgb doctor           read-only preflight of this machine
+#   wgb --help
+#
+# AI-assisted: a coding agent wrote most of this (see README.md).
+#
+# Design notes (see PLAN.md for the full rationale):
+#   * Every generated config comes from a pure render_* function, so output can be
+#     tested without root, a tunnel, or a network.
+#   * Firewall rules live in one owned nftables table (inet wgb), created and destroyed
+#     atomically. There is no PostUp/PostDown rule juggling in the WireGuard config, so
+#     bring-up is idempotent and teardown cannot leave orphan rules.
+
+# Backticks appear as literal text in generated config comments and in messages printed
+# for the operator; they are never meant to be command substitution.
+# shellcheck disable=SC2016
+# SC2034: QR_PNG is parsed here but consumed by `qr --png` (M3); drop this directive once
+# that path lands. PURGE is consumed by `down --purge` in apply_down.
+# shellcheck disable=SC2034
+
+# Strictness applies only when this file is executed. When it is sourced (by the test
+# suite) the caller's shell options must not be modified.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -euo pipefail
+fi
+
+WGB_VERSION="0.1.0"
+PROG="wgb"
+
+# ------------------------------------------------------------------ paths ---
+# The WGB_* overrides exist so the integration test can run a real up/down cycle inside
+# a throwaway network namespace without touching this host's /etc, /run or out/.
+STATE_DIR="${WGB_STATE_DIR:-/run/wgb}"
+WG_ETC_DIR="${WGB_ETC_DIR:-/etc/wireguard}"
+HOST_OS="$(uname -s)"
+PF_PARENT=wgb
+if [[ "$HOST_OS" == Darwin ]]; then STATE_DIR="${WGB_STATE_DIR:-}"; fi
+OUT_BASE="${WGB_OUT_BASE:-$PWD/out}"
+NFT_TABLE="wgb"
+# Set when the caller pinned the output base through the environment, so a later command run from
+# a different working directory can adopt the base the session actually used (`down --purge` from
+# elsewhere would otherwise look for the profiles under a base that never held them).
+if [[ -n "${WGB_OUT_BASE:-}" ]]; then OUT_BASE_SET=1; else OUT_BASE_SET=0; fi
+# Where profile directories are remembered BETWEEN sessions. The ephemeral state disappears on a
+# plain `down` and on a reboot, and the output base defaults to $PWD/out, so without a persistent
+# record a later `qr` from another directory cannot find a profile that is sitting on disk.
+INDEX_DIR="${WGB_INDEX_DIR:-/var/lib/wgb}"
+
+# --------------------------------------------------------------- defaults ---
+# Kept behaviourally compatible with the archived web generator: subnet 10.13.37.0/24,
+# server .1, clients .2+, DNS 1.1.1.1, WG port 51820, Burp 8083, keepalive 25.
+DEFAULT_IFACE="wgm0"
+DEFAULT_SUBNET="10.13.37.0/24"
+DEFAULT_DNS="1.1.1.1"
+DEFAULT_LISTEN_PORT="51820"
+DEFAULT_BURP_PORT="8083"
+DEFAULT_MTU="1380"
+DEFAULT_ALLOWED_IPS="0.0.0.0/0, ::/0"
+DEFAULT_CLIENTS="1"
+KEEPALIVE="25"
+
+# ------------------------------------------------------------ config state ---
+# Resolved settings live in globals so render_* functions stay pure and the test suite
+# can set them directly. No test-only CLI flags exist.
+IFACE="$DEFAULT_IFACE"
+SUBNET="$DEFAULT_SUBNET"
+DNS="$DEFAULT_DNS"
+LISTEN_PORT="$DEFAULT_LISTEN_PORT"
+BURP_PORT="$DEFAULT_BURP_PORT"
+MTU="$DEFAULT_MTU"
+ALLOWED_IPS="$DEFAULT_ALLOWED_IPS"
+WAN_IFACE=""
+ENDPOINT=""
+PROXY_MODE=1
+BLOCK_QUIC=1
+# 1 = when ufw (not this tool) is what drops forwarded traffic, add the route rule it needs. The
+# addition is recorded in the state and removed by `down`; --no-fix-firewall keeps it as advice only.
+FIX_FIREWALL=1
+CLIENT_COUNT="$DEFAULT_CLIENTS"
+SERVER_PRIVKEY=""
+SERVER_PUBKEY=""
+CLIENT_NAMES=()
+CLIENT_PRIVKEYS=()
+CLIENT_PUBKEYS=()
+CLIENT_ADDRS=()
+# For each client: 1 = a key was generated on this run (so its profile is written),
+# 0 = reused from the existing config (its private key is not on this machine to rewrite).
+CLIENT_IS_NEW=()
+# Names this run actually asked for, so a peer kept from an earlier session can be called out.
+REQUESTED_NAMES=()
+
+# --------------------------------------------------------------- run state ---
+CMD=""
+DRY_RUN=0
+PRINT_CONFIG=0
+PRINT_RULES=0
+# shellcheck disable=SC2034  # consumed by `down --purge` (M2)
+PURGE=0
+# shellcheck disable=SC2034  # consumed by `qr --png` (M3)
+QR_PNG=0
+# Regenerate every key on `up` instead of reusing the existing config's keys and peers.
+FRESH=0
+WAIT_TIMEOUT="120"
+# A handshake younger than this counts as evidence of a live client, even if it happened
+# before `wait` started: scanning the QR, connecting, then running `wait` is the normal order.
+WAIT_FRESH="180"
+OUTDIR=""
+# Profiles written on this run (a repeat run that reuses every peer writes none).
+NEW_PROFILE_COUNT=0
+# shellcheck disable=SC2034  # read by render_state_file, written by apply_up / ensure_outdir
+PRIOR_IP_FORWARD=""
+EXTRA=()
+WAN_DETECTED=0
+ENDPOINT_DETECTED=0
+# 1 when the endpoint was defaulted to an address this host HOLDS (its main local one). That is
+# what happens on a NATed machine, where the detected public address belongs to the NAT and is not
+# reachable from outside without a port forward.
+ENDPOINT_IS_LOCAL=0
+# The public address that was found but not used, so the messages can say what cellular needs.
+PUBLIC_CANDIDATE=""
+IFACE_SET=0
+# Set when the caller named the config directory explicitly (--config-dir), so a live session's
+# directory is not silently overridden by the default.
+CONF_DIR_SET=0
+# Backups this session created, recorded in the state file so --purge can remove exactly those.
+BACKUPS=()
+# What `up` changed in another firewall, so `down` can undo exactly that (empty when nothing).
+FIREWALL_FIX=""
+
+# ----------------------------------------------------------------- output ---
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'
+else
+  C_RESET=""
+  C_DIM=""
+  C_BOLD=""
+  C_RED=""
+  C_GRN=""
+  C_YEL=""
+fi
+
+log()  { printf '%s%s%s %s\n' "$C_DIM" "[$PROG]" "$C_RESET" "$*"; }
+warn() { printf '%s%s%s %s\n' "$C_YEL" "[$PROG]" "$C_RESET" "$*" >&2; }
+
+# die <message> [exit code] - the message only; the code is never printed as text.
+die() {
+  local msg="$1" code="${2:-1}"
+  printf '%s%s%s %s\n' "$C_RED" "[$PROG]" "$C_RESET" "$msg" >&2
+  exit "$code"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+hr()   { printf '%s\n' "------------------------------------------------------------"; }
+
+usage() {
+  cat <<EOF
+$PROG $WGB_VERSION - WireGuard tunnel that drives a client's traffic through Burp Suite.
+
+USAGE
+  $PROG up [options]          bring the tunnel and interception rules up
+  $PROG down [--purge]        tear everything down (atomic)
+  $PROG status                tunnel, rules, and handshake state
+  $PROG doctor                read-only preflight of this machine
+  $PROG list                  peers, addresses, last handshake
+  $PROG add-client NAME       add a peer, lowest free address, existing peers untouched
+  $PROG remove-client NAME    remove a peer
+  $PROG qr NAME [--png]       print an importable QR for a client profile
+  $PROG wait [--timeout N]    block until a handshake lands, then report ready
+  $PROG ca                    how to get the Burp CA trusted on the client
+  $PROG version | --help
+
+OPTIONS FOR up
+  --iface NAME        tunnel interface            (default $DEFAULT_IFACE)
+  --subnet CIDR       tunnel subnet, must be /24  (default $DEFAULT_SUBNET)
+  --listen-port PORT  WireGuard UDP port          (default $DEFAULT_LISTEN_PORT)
+  --burp-port PORT    interception listener port  (default $DEFAULT_BURP_PORT)
+  --dns IP            client DNS resolver         (default $DEFAULT_DNS)
+  --mtu N             tunnel MTU                  (default $DEFAULT_MTU, cellular-safe)
+  --endpoint HOST     address the client dials    (default: the public address if this host holds
+                      it, otherwise the main local LAN/WLAN address)
+  --wan NAME          outbound interface          (default: auto-detected)
+  --config-dir DIR    absolute directory for the generated server config
+                      (default /etc/wireguard - where wg-quick, systemd and every other
+                      tool look; must be root-only, never a user-writable directory)
+  --clients N         create N client profiles (named "client", or client1..clientN for N>1)
+  --no-proxy          tunnel only: no TCP redirect to Burp
+  --allow-quic        do not block UDP 443 (QUIC will bypass the proxy)
+  --no-fix-firewall   do not add the ufw route rule this tool would otherwise add when another
+                      firewall (ufw) drops forwarded traffic; only report it
+  --fresh             regenerate every key (breaks profiles already imported on a device)
+  --dry-run           print the full plan, change nothing (works without root)
+  --print-config      print server and client configs to stdout, change nothing
+  --print-rules       print the nftables ruleset to stdout, change nothing
+
+Exit codes (a legend of what this program returns, not a report about this run):
+  0 ok, 1 runtime failure, 2 usage error.
+EOF
+}
+
+# ----------------------------------------------------------- net helpers ---
+subnet_base() { local net="${1%%/*}"; printf '%s.' "${net%.*}"; }
+subnet_cidr() { printf '%s' "${1##*/}"; }
+server_ip()   { printf '%s1' "$(subnet_base "$SUBNET")"; }
+server_addr() { printf '%s1/%s' "$(subnet_base "$SUBNET")" "$(subnet_cidr "$SUBNET")"; }
+
+# An IPv6 link address inside the tunnel, derived from the IPv4 subnet (decimal digits are valid hex
+# digits, so every subnet maps to one ULA). This exists for exactly one reason: the kernel can only
+# send an ICMPv6 error if it has a source address to send it from. Without any IPv6 address, an IPv6
+# packet from the client is discarded during route lookup with nothing sent back - the client waits,
+# and the app reports a TLS/connection failure on every dual-stack site, which is the reported
+# symptom and looks nothing like an IPv6 problem.
+ula_base() {
+  local net="${SUBNET%%/*}"
+  printf 'fd%s:%s' "$(printf '%s' "$net" | cut -d. -f2)" "$(printf '%s' "$net" | cut -d. -f3)"
+}
+server_ip6() { printf '%s::1' "$(ula_base)"; }
+client_ip6() { printf '%s::%s' "$(ula_base)" "$(printf '%s' "$1" | sed 's/^.*\.//')"; }
+
+is_ipv4() {
+  local ip="$1" o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    # Reject leading zeros outright: resolv.conf, nft and the WireGuard tools disagree about them,
+    # and bash would read "08" as a broken octal in arithmetic.
+    [[ "$o" == 0 || "$o" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+    (( o <= 255 )) || return 1
+  done
+  return 0
+}
+
+# Interface names are capped at 15 characters by the kernel, and they are written into the nft
+# ruleset: a quote or a newline in a name would otherwise land in the ruleset as syntax.
+is_iface_name() { [[ "$1" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]; }
+
+# An IPv4 literal or a hostname. Whitespace, quotes and newlines are rejected because --endpoint
+# is written into the client profile: a newline there injects extra lines into the profile that
+# gets scanned onto the client.
+is_host() {
+  local h="$1"
+  is_ipv4 "$h" && return 0
+  [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]]
+}
+
+# RFC1918 / CGNAT / loopback / link-local - i.e. not reachable from a client on cellular.
+is_private_ip() {
+  local ip="$1"
+  case "$ip" in
+    10.*|192.168.*|127.*|169.254.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Lowest free host address (2..254) in the subnet, skipping addresses already in use.
+# Called with the addresses currently assigned to existing peers.
+alloc_next_ip() {
+  local base host ip used
+  base="$(subnet_base "$SUBNET")"
+  for ((host = 2; host <= 254; host++)); do
+    ip="${base}${host}"
+    for used in "${@:-}"; do
+      [[ -n "$used" && "$used" == "$ip" ]] && continue 2
+    done
+    printf '%s' "$ip"
+    return 0
+  done
+  return 1
+}
+
+detect_wan_iface() {
+  local iface=""
+  if [[ "$HOST_OS" == Darwin ]]; then
+    iface="$(/sbin/route -n get default 2>/dev/null | awk '$1 == "interface:" { print $2 }' || true)"
+  elif have ip; then
+    iface="$(ip -4 route get 1.1.1.1 2>/dev/null |
+      awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+    if [[ -z "$iface" ]]; then
+      iface="$(ip -4 route show default 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+    fi
+  fi
+  printf '%s' "$iface"
+}
+
+local_ipv4() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    route_src_ipv4
+    return
+  fi
+  have ip || return 1
+  ip -4 -o addr show scope global 2>/dev/null |
+    awk '{ print $4 }' | cut -d/ -f1 |
+    grep -v "^$(subnet_base "$SUBNET")" | head -1
+}
+
+# Every IPv4 address this host holds, loopback included. "Holds" is the question that matters when
+# advertising an endpoint: an address the host does not hold lives at whatever NATs for it.
+local_ipv4_all() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    /sbin/ifconfig -a | awk '$1 == "inet" { print $2 }'
+    return
+  fi
+  have ip || return 1
+  ip -4 -o addr show 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1
+}
+
+# The source address of the default route: the LAN address a port forward would have to target.
+route_src_ipv4() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    local wan="${WAN_IFACE:-}"
+    [[ -n "$wan" ]] || wan="$(detect_wan_iface)"
+    [[ -n "$wan" ]] || return 1
+    /sbin/ifconfig "$wan" | awk '$1 == "inet" && !seen++ { print $2 }'
+    return
+  fi
+  have ip || return 1
+  ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+}
+
+# Every IPv6 address this host holds, loopback included.
+local_ipv6_global() {
+  have ip || return 1
+  ip -6 -o addr show scope global 2>/dev/null | awk '{ print $4 }' | cut -d/ -f1
+  return 0
+}
+
+nat_target_hint() {
+  local src
+  src="$(route_src_ipv4 || true)"
+  # No apostrophe here: an unbalanced quote inside ${var:-default} breaks bash's parser and the
+  # error surfaces far away, at the next unbalanced token.
+  printf '%s' "${src:-the LAN address of this host}"
+}
+
+# True ONLY when we can be sure: the endpoint is an IPv4 literal this host does not hold, so the
+# address exists somewhere upstream and an inbound handshake needs a port forward to reach us.
+# A hostname cannot be judged this way, so it is never claimed to be behind NAT.
+endpoint_behind_nat() {
+  local ep="$1" addr
+  is_ipv4 "$ep" || return 1
+  [[ "$HOST_OS" == Darwin ]] || have ip || return 1
+  while read -r addr; do
+    if [[ "$addr" == "$ep" ]]; then return 1; fi
+  done < <(local_ipv4_all 2>/dev/null)
+  return 0
+}
+
+detect_public_ip() {
+  have curl || return 1
+  curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null
+}
+
+# Bind addresses of the TCP listener on $BURP_PORT (one per line, may be empty).
+burp_bind_addrs() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    /usr/sbin/lsof -nP -a -iTCP:"$BURP_PORT" -sTCP:LISTEN -Fn 2>/dev/null |
+      awk '/^n/ { sub(/^n/, ""); sub(/:[0-9]+$/, ""); gsub(/^\[|\]$/, ""); print }' | sort -u
+    return
+  fi
+  have ss || return 1
+  ss -ltnH "sport = :$BURP_PORT" 2>/dev/null | awk '{ print $4 }' |
+    sed 's/^\[\(.*\)\]$/\1/; s/:[0-9]*$//' | sort -u
+}
+
+udp_port_bound() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    /usr/sbin/lsof -nP -iUDP:"$1" >/dev/null 2>&1
+    return
+  fi
+  have ss || return 1
+  [[ -n "$(ss -lunH "sport = :$1" 2>/dev/null)" ]]
+}
+
+# ----------------------------------------------------------- key helpers ---
+gen_privkey() {
+  if have wg; then
+    wg genkey
+  else
+    printf 'DRY-RUN-PLACEHOLDER-PRIVATE-KEY'
+  fi
+}
+
+gen_pubkey() {
+  local priv="$1"
+  if have wg; then
+    printf '%s' "$priv" | wg pubkey
+  else
+    printf 'DRY-RUN-PLACEHOLDER-PUBLIC-KEY'
+  fi
+}
+
+# ============================================================ render layer ===
+# Pure: no writes, no exec of anything that changes system state.
+
+render_server_conf() {
+  printf '[Interface]\n'
+  printf '# generated by %s %s - firewall rules are owned by %s (nft table inet %s)\n' \
+    "$PROG" "$WGB_VERSION" "$PROG" "$NFT_TABLE"
+  printf 'Address = %s, %s/64\n' "$(server_addr)" "$(server_ip6)"
+  printf 'ListenPort = %s\n' "$LISTEN_PORT"
+  printf 'PrivateKey = %s\n' "$SERVER_PRIVKEY"
+  printf 'MTU = %s\n' "$MTU"
+  local i
+  if [[ ${#CLIENT_NAMES[@]} -gt 0 ]]; then
+    for i in "${!CLIENT_NAMES[@]}"; do
+      printf '\n[Peer]\n'
+      printf '# client: %s\n' "${CLIENT_NAMES[$i]}"
+      printf 'PublicKey = %s\n' "${CLIENT_PUBKEYS[$i]}"
+      # The client's IPv6 ULA belongs in the peer's AllowedIPs: without it, WireGuard's cryptokey
+      # routing drops the IPv6 the client sends INSIDE the tunnel (invalid source address), so the
+      # reject rule never sees it and the client waits on a black hole instead of being told.
+      printf 'AllowedIPs = %s/32, %s/128\n' "${CLIENT_ADDRS[$i]}" "$(client_ip6 "${CLIENT_ADDRS[$i]}")"
+    done
+  fi
+}
+
+# Deliberately comment-free and minimal: the profile is QR-encoded, and every byte
+# makes the code denser to photograph off a dim laptop screen.
+render_client_conf() {
+  local addr="$1" priv="$2"
+  printf '[Interface]\n'
+  printf 'PrivateKey = %s\n' "$priv"
+  printf 'Address = %s/32, %s/64\n' "$addr" "$(client_ip6 "$addr")"
+  printf 'DNS = %s\n' "$DNS"
+  printf 'MTU = %s\n' "$MTU"
+  printf '\n[Peer]\n'
+  printf 'PublicKey = %s\n' "$SERVER_PUBKEY"
+  printf 'AllowedIPs = %s\n' "$ALLOWED_IPS"
+  printf 'Endpoint = %s:%s\n' "$ENDPOINT" "$LISTEN_PORT"
+  printf 'PersistentKeepalive = %s\n' "$KEEPALIVE"
+}
+
+render_nft() {
+  # `counter` on every rule: on-site diagnosis needs to know WHICH rule matched, and nft prints the
+  # counts in `nft list table inet wgb` with no extra tooling. A rule with zero packets is the whole
+  # answer to "the client connects but nothing happens".
+  printf '# generated by %s %s - do not edit; re-run `%s up`\n' "$PROG" "$WGB_VERSION" "$PROG"
+  printf 'table inet %s {\n' "$NFT_TABLE"
+  printf '\tchain %s_pre {\n' "$NFT_TABLE"
+  printf '\t\ttype nat hook prerouting priority dstnat; policy accept;\n'
+  # Port-53 redirect first: nft evaluates in order, and a catch-all redirect above these
+  # would swallow DNS. Skipped when the client resolver IS this box: DNAT to the address
+  # that is already the destination is a self-referential blackhole.
+  if [[ "$DNS" != "$(server_ip)" ]]; then
+    printf '\t\tip saddr %s udp dport 53 counter dnat to %s\n' "$SUBNET" "$DNS"
+    printf '\t\tip saddr %s tcp dport 53 counter dnat to %s\n' "$SUBNET" "$DNS"
+  fi
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    # `meta l4proto tcp`, not a bare `tcp`: a `tcp` expression must be followed by a tcp
+    # option (sport, dport, flags...), so `tcp redirect` does not parse.
+    printf '\t\tip saddr %s meta l4proto tcp counter redirect to :%s\n' "$SUBNET" "$BURP_PORT"
+  fi
+  printf '\t}\n'
+  printf '\tchain %s_post {\n' "$NFT_TABLE"
+  printf '\t\ttype nat hook postrouting priority srcnat; policy accept;\n'
+  printf '\t\tip saddr %s oifname "%s" counter masquerade\n' "$SUBNET" "$WAN_IFACE"
+  printf '\t}\n'
+  # The chain name must not be the bare word `fwd`: that is an nft reserved word and the
+  # parser rejects it as a chain name.
+  printf '\tchain %s_forward {\n' "$NFT_TABLE"
+  printf '\t\ttype filter hook forward priority filter; policy accept;\n'
+  if [[ "$BLOCK_QUIC" == 1 ]]; then
+    printf '\t\tiifname "%s" udp dport 443 counter drop\n' "$IFACE"
+  fi
+  printf '\t\tiifname "%s" counter accept\n' "$IFACE"
+  printf '\t\toifname "%s" counter accept\n' "$IFACE"
+  printf '\t}\n'
+  # The client profile routes ::/0 into this tunnel, but the tunnel carries IPv4 only: there is no
+  # IPv6 forwarding and no IPv6 masquerade here. So an IPv6 packet from the client has to be
+  # ANSWERED, not swallowed. It is rejected here, in a prerouting chain, and not in the forward
+  # chain, because a packet with no IPv6 route dies during route lookup - before any forward rule
+  # runs - and with no IPv6 address on the tunnel the kernel cannot even send the ICMPv6 that says
+  # so. That silent drop is what the client waits on, and what its app finally reports as a TLS or
+  # connection failure on every dual-stack site: the reported "many SSL errors", with nothing wrong
+  # with the certificate. The tunnel's own ULA addresses (server_ip6()/client_ip6()) are what make
+  # the ICMPv6 answer possible; they are never used for routing, so IPv6 still is not carried.
+  # Keeping ::/0 in AllowedIPs and rejecting it INSIDE the tunnel is deliberate: dropping it from
+  # AllowedIPs would send the client's IPv6 to the internet around the interception, silently
+  # bypassing the proxy.
+  printf '\tchain %s_guard {\n' "$NFT_TABLE"
+  printf '\t\ttype filter hook prerouting priority raw; policy accept;\n'
+  printf '\t\tiifname "%s" meta nfproto ipv6 counter reject with icmpv6 type no-route\n' "$IFACE"
+  printf '\t}\n'
+  printf '}\n'
+}
+
+# Experimental PF translation for the macOS parser gate. Nothing loads this ruleset yet.
+# Use the kernel interface (utunN), not the logical WireGuard config name.
+render_pf() { # <tunnel interface> [WAN interface]
+  local tun="$1" wan="${2:-$WAN_IFACE}" host
+  [[ "$tun" =~ ^utun[0-9]+$ ]] && is_iface_name "$tun" || return 1
+  [[ "$wan" =~ ^[a-zA-Z][a-zA-Z0-9]*[0-9]$ && "$tun" != "$wan" ]] && is_iface_name "$wan" || return 1
+  [[ "$SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24$ ]] || return 1
+  host="$(server_ip)"
+  is_ipv4 "$host" && is_ipv4 "$DNS" || return 1
+  [[ "$BURP_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$BURP_PORT >= 1 && 10#$BURP_PORT <= 65535 )) || return 1
+
+  printf 'nat on %s inet from %s to any -> (%s)\n' "$wan" "$SUBNET" "$wan"
+  # PF translation is first match, so keep DNS ahead of the general TCP redirect.
+  if [[ "$DNS" != "$host" ]]; then
+    printf 'rdr on %s inet proto { tcp, udp } from %s to any port 53 -> %s port 53\n' "$tun" "$SUBNET" "$DNS"
+  elif [[ "$PROXY_MODE" == 1 ]]; then
+    printf 'no rdr on %s inet proto tcp from %s to %s port 53\n' "$tun" "$SUBNET" "$host"
+  fi
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    printf 'rdr on %s inet proto tcp from %s to any -> %s port %s\n' "$tun" "$SUBNET" "$host" "$((10#$BURP_PORT))"
+  fi
+  printf 'block return-icmp6 in quick on %s inet6 all\n' "$tun"
+  if [[ "$BLOCK_QUIC" == 1 ]]; then
+    printf 'block drop in quick on %s inet proto udp from %s to any port 443\n' "$tun" "$SUBNET"
+  fi
+  printf 'pass in on %s inet from %s to any keep state\n' "$tun" "$SUBNET"
+}
+
+render_state_file() {
+  printf 'IFACE=%s\n' "$IFACE"
+  printf 'WAN_IFACE=%s\n' "$WAN_IFACE"
+  printf 'SUBNET=%s\n' "$SUBNET"
+  printf 'DNS=%s\n' "$DNS"
+  printf 'LISTEN_PORT=%s\n' "$LISTEN_PORT"
+  printf 'BURP_PORT=%s\n' "$BURP_PORT"
+  printf 'MTU=%s\n' "$MTU"
+  printf 'ENDPOINT=%s\n' "$ENDPOINT"
+  printf 'PROXY_MODE=%s\n' "$PROXY_MODE"
+  printf 'BLOCK_QUIC=%s\n' "$BLOCK_QUIC"
+  printf 'OUTDIR=%s\n' "${OUTDIR:-}"
+  printf 'OUT_BASE=%s\n' "${OUT_BASE:-}"
+  printf 'CONF_DIR=%s\n' "$WG_ETC_DIR"
+  printf 'BACKUPS=%s\n' "${BACKUPS[*]:-}"
+  printf 'FIREWALL_FIX=%s\n' "${FIREWALL_FIX:-}"
+  printf 'PRIOR_IP_FORWARD=%s\n' "${PRIOR_IP_FORWARD:-}"
+}
+
+# ============================================================= apply layer ===
+# Everything below mutates the system and requires root.
+
+state_file() { printf '%s/%s.env' "$STATE_DIR" "$IFACE"; }
+server_conf_path() { printf '%s/%s.conf' "$WG_ETC_DIR" "$IFACE"; }
+
+ensure_root() {
+  [[ "$(id -u)" == 0 ]] ||
+    die "this changes the system and needs root: re-run with sudo (or use --dry-run)" 1
+}
+
+# Read one key from a state file. Deliberately a parser, not `source`: a state file is a
+# file on disk, and sourcing files as root is how mistakes become incidents.
+state_get() {
+  local key="$1" file="$2" line
+  [[ -r "$file" ]] || return 1
+  line="$(grep -m1 "^${key}=" "$file" 2>/dev/null)" || return 1
+  printf '%s' "${line#*=}"
+}
+
+# Content on stdin, written atomically with the given mode.
+write_atomic() {
+  local path="$1" mode="$2" tmp
+  mkdir -p "$(dirname "$path")"
+  tmp="$(dirname "$path")/.$(basename "$path").tmp.$$"
+  # Created under a restrictive umask: these files carry private keys, and a file that is briefly
+  # world-readable before the chmod is a file that was world-readable.
+  (umask 077; cat >"$tmp") || return 1
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+current_ip_forward() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    /usr/sbin/sysctl -n net.inet.ip.forwarding
+    return
+  fi
+  if have sysctl; then
+    sysctl -n net.ipv4.ip_forward 2>/dev/null || printf '0'
+  else
+    cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || printf '0'
+  fi
+}
+
+# ------------------------------------------------------------ apply steps ---
+# wireguard-tools ships /etc/wireguard as 0700 root:root. If the directory is ever missing
+# (a non-Debian package layout, a container image, or someone removed it), recreate it the
+# same way instead of letting the ambient umask decide.
+ensure_etc_dir() { # <directory>
+  local dir="$1"
+  [[ -d "$dir" ]] && return 0
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" || return 1
+  return 0
+}
+
+# The state directory holds the session record; create it with its mode rather than letting the
+# ambient umask decide and fixing it later in load_rules.
+ensure_state_dir() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; }
+
+file_mode() {
+  local mode
+  if ! mode="$(stat -c '%a' "$1" 2>/dev/null)"; then
+    mode="$(stat -f '%Lp' "$1" 2>/dev/null)" || return 1
+  fi
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  printf '%s\n' "$mode"
+}
+
+# A config directory other users can write to is a privilege-escalation shape: the file inside it
+# is loaded by root (wg-quick, systemd), so whoever can replace it decides what root loads. The
+# help text states this rule; refusing to write is what enforces it.
+assert_conf_dir_safe() {
+  local dir="$WG_ETC_DIR" mode group other
+  [[ -d "$dir" ]] || return 0
+  mode="$(file_mode "$dir")" || die "could not verify permissions on config directory $dir" 1
+  group="${mode: -2:1}"
+  other="${mode: -1}"
+  if [[ "$group" =~ [2367] || "$other" =~ [2367] ]]; then
+    die "refusing to write a root-loaded config into $dir: mode $mode lets other users replace it. chmod 700 $dir (or pick a root-only directory with --config-dir)" 1
+  fi
+  return 0
+}
+
+backup_config() {
+  local conf stamp backup
+  conf="$(server_conf_path)"
+  [[ -e "$conf" ]] || return 0
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="${conf}.bak-${stamp}"
+  cp -a "$conf" "$backup" || return 1
+  # Recorded so `down --purge` can remove this session's own backups: a backup holds the same
+  # private keys, and leaving key material behind after a purge defeats the purge. Recorded durably
+  # as well, because the state file does not survive a reboot and the backup on disk does.
+  BACKUPS+=("$backup")
+  record_undo "backup:$backup"
+  log "existing config backed up to $backup"
+}
+
+# ------------------------------------------- durable undo record ---
+# The session state lives under /run, which is tmpfs: a reboot empties it. But the things this tool
+# changes OUTSIDE its own objects - a rule added in another firewall, a config backup that holds the
+# same private keys - are written to disk and outlive that reboot. Recording them only in /run means
+# that afterwards `down` cannot revert them and cannot even tell they exist, which breaks the tool's
+# promise ("down reverts exactly what it changed"). This file is that record. Paths and rule specs
+# only, never key material, so it is readable on purpose (mode 644).
+undo_log_file() { printf '%s/undo-log' "$INDEX_DIR"; }
+
+record_undo() { # <entry: kind:value, e.g. ufw-route:10.13.37.0/24 or backup:/etc/...>
+  local entry="$1" f tmp
+  [[ -n "$entry" ]] || return 0
+  f="$(undo_log_file)"
+  mkdir -p "$INDEX_DIR" 2>/dev/null || return 0
+  chmod 755 "$INDEX_DIR" 2>/dev/null || true
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  { grep -vxF "$entry" "$f" 2>/dev/null || true; printf '%s\n' "$entry"; } | tail -n 50 >"$tmp"
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || true
+  return 0
+}
+
+recorded_undos() {
+  local f
+  f="$(undo_log_file)"
+  [[ -r "$f" ]] || return 0
+  cat "$f"
+  return 0
+}
+
+recorded_undos_of() { # <kind> -> values only
+  local kind="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      "$kind":*) printf '%s\n' "${line#*:}" ;;
+    esac
+  done < <(recorded_undos)
+}
+
+forget_undo() { # <entry>
+  local entry="$1" f tmp
+  f="$(undo_log_file)"
+  [[ -r "$f" ]] || return 0
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  grep -vxF "$entry" "$f" >"$tmp" 2>/dev/null || true
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || true
+  return 0
+}
+
+# Every backup this tool made that is still accounted for: the session record (fast path) plus the
+# durable record (what survives a reboot). De-duplicated, because a session's own backups appear in
+# both. Paths only.
+accounted_backups() { # [session list, space separated]
+  local session="${1:-}"
+  { printf '%s\n' "$session" | tr ' ' '\n'; recorded_undos_of backup; } |
+    awk 'NF && !seen[$0]++'
+  return 0
+}
+
+pf() { /sbin/pfctl "$@"; }
+pf_anchor() { printf '%s/%s' "$PF_PARENT" "$IFACE"; }
+pf_file() { printf '%s/%s.pf' "$STATE_DIR" "$IFACE"; }
+pf_ref_file() { printf '%s/%s.pf-ref' "$STATE_DIR" "$IFACE"; }
+
+pf_has_hook() { # <rule keyword> ; PF listing on stdin
+  awk -v keyword="$1" -v name="\"$PF_PARENT/*\"" \
+    '$1 == keyword && $2 == name && (NF == 2 || (NF == 3 && $3 == "all")) { ok=1 } END { exit !ok }'
+}
+
+pf_hooks_ready() {
+  local nat rules
+  nat="$(pf -s nat)" && rules="$(pf -s rules)" || return 1
+  pf_has_hook nat-anchor <<<"$nat" && pf_has_hook rdr-anchor <<<"$nat" && pf_has_hook anchor <<<"$rules"
+}
+
+pf_token() {
+  awk '$1 == "Token" && $2 == ":" && $3 ~ /^[0-9]+$/ { print $3 }' "$1"
+}
+
+pf_child_empty() {
+  local rules nat anchor
+  anchor="$(pf_anchor)"
+  rules="$(pf -a "$anchor" -s rules)" && nat="$(pf -a "$anchor" -s nat)" || return 1
+  [[ -z "$rules" && -z "$nat" ]]
+}
+
+pf_start() {
+  local real file anchor token
+  real="$(live_wg_iface "$IFACE")" || return 1
+  file="$(pf_file)"; anchor="$(pf_anchor)"
+  render_pf "$real" | write_atomic "$file" 0600 || return 1
+  pf -n -a "$anchor" -f "$file" || return 1
+  # Capture the token directly in the root-only journal, including on interruption.
+  (umask 077; pf -E >"$(pf_ref_file)" 2>&1) || return 1
+  token="$(pf_token "$(pf_ref_file)")" && [[ "$token" =~ ^[0-9]+$ ]] || return 1
+  pf -a "$anchor" -f "$file"
+}
+
+pf_stop() {
+  local file ref anchor token
+  file="$(pf_file)"; ref="$(pf_ref_file)"; anchor="$(pf_anchor)"
+  if [[ -e "$file" ]]; then
+    pf -a "$anchor" -F rules && pf -a "$anchor" -F nat && pf_child_empty || return 1
+    rm -f "$file" || return 1
+  fi
+  if [[ -e "$ref" ]]; then
+    token="$(pf_token "$ref")" && [[ "$token" =~ ^[0-9]+$ ]] || return 1
+    pf -X "$token" && rm -f "$ref" || return 1
+  fi
+}
+
+darwin_network_down() { # <recorded forwarding value>
+  local rc=0
+  # Stop traffic before removing the redirect and restoring global forwarding.
+  link_down "$IFACE" || return 1
+  [[ ! -e "/var/run/wireguard/$IFACE.name" ]] || return 1
+  pf_stop || rc=1
+  restore_forwarding "$1" || rc=1
+  return "$rc"
+}
+
+darwin_prepare_up() {
+  local sf f key prior
+  if ! have wg || ! have wg-quick || ! have wireguard-go; then
+    die 'Install wireguard-tools with Homebrew and make it available under sudo.' 1
+  fi
+  pf_hooks_ready || die 'Required wgb/* PF hooks are not active; see docs/macos.md. No firewall or tunnel changes made.' 1
+  sf="$(state_file)"
+  for f in "$STATE_DIR"/*.env; do
+    [[ ! -e "$f" || "$f" == "$sf" ]] || die 'Only one macOS tunnel may be active; run sudo wgb down first.' 1
+  done
+  if [[ -e "$sf" ]]; then
+    live_wg_iface "$IFACE" >/dev/null && [[ -s "$(pf_file)" && -s "$(pf_ref_file)" ]] ||
+      die 'Incomplete macOS session; run sudo wgb down before retrying.' 1
+    [[ "$FRESH" == 0 ]] || die 'Run sudo wgb down before using --fresh on macOS.' 1
+    for key in SUBNET WAN_IFACE DNS LISTEN_PORT BURP_PORT MTU PROXY_MODE BLOCK_QUIC; do
+      [[ "$(state_get "$key" "$sf" || true)" == "${!key}" ]] ||
+        die "Active macOS session has a different $key; run sudo wgb down before changing network settings." 1
+    done
+    prior="$(state_get PRIOR_IP_FORWARD "$sf" || true)"
+    [[ "$prior" == 0 || "$prior" == 1 ]] || die 'Invalid forwarding value in macOS state.' 1
+    PRIOR_IP_FORWARD="$prior"
+  else
+    [[ ! -e "/var/run/wireguard/$IFACE.name" && ! -L "/var/run/wireguard/$IFACE.name" ]] ||
+      die "WireGuard name $IFACE already exists outside a tracked session." 1
+    if [[ -e "$(pf_file)" || -e "$(pf_ref_file)" ]] || ! pf_child_empty; then
+      die 'The macOS PF anchor is not empty or cannot be inspected; refusing to take ownership.' 1
+    fi
+    prior="$(current_ip_forward)" && [[ "$prior" == 0 || "$prior" == 1 ]] ||
+      die 'Cannot read the prior macOS IPv4 forwarding value.' 1
+    PRIOR_IP_FORWARD="$prior"
+  fi
+}
+
+darwin_boot_id() { /usr/sbin/sysctl -n kern.bootsessionuuid; }
+
+darwin_default_state_dir() {
+  local boot
+  boot="$(darwin_boot_id)" || return 1
+  [[ "$boot" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]] || return 1
+  # /private/var/run is group-writable on macOS. Keep the same ownership guard
+  # and scope the on-disk journal to one boot so stale PF references aren't reused.
+  printf '/private/var/db/wgb/state-%s\n' "$boot"
+}
+
+# Check existing ancestors before creating or loading a root-owned path. Resolve the
+# normal /etc and /var aliases first, but never accept their referents by mode alone.
+trusted_root_path() {
+  local p="$1" mode owner
+  [[ "$p" == /* ]] || return 1
+  while [[ ! -e "$p" ]]; do
+    [[ ! -L "$p" ]] || return 1
+    p="$(dirname "$p")"
+  done
+  if [[ -d "$p" ]]; then
+    p="$(cd "$p" && pwd -P)" || return 1
+  else
+    [[ -f "$p" && ! -L "$p" ]] || return 1
+    p="$(cd "$(dirname "$p")" && pwd -P)/$(basename "$p")" || return 1
+  fi
+  while :; do
+    if ! mode="$(file_mode "$p")" || ! owner="$(stat -f '%u' "$p")"; then
+      warn "could not inspect ownership or permissions of $p"
+      return 1
+    fi
+    if [[ "$owner" != 0 || "${mode: -2:1}${mode: -1}" =~ [2367] ]]; then
+      warn "untrusted path component: $p (uid $owner, mode $mode)"
+      return 1
+    fi
+    [[ "$p" != / ]] || return 0
+    p="$(dirname "$p")"
+  done
+}
+
+# Linux creates and removes one owned nft table.
+load_rules() {
+  local nft_file="$STATE_DIR/$IFACE.nft"
+  have nft || {
+    warn "nft not found - install nftables"
+    return 1
+  }
+  ensure_state_dir || return 1
+  render_nft | write_atomic "$nft_file" 0600 || return 1
+  # Parse it BEFORE deleting the current table: a ruleset that does not parse must not cost a
+  # session that is already running its interception rules.
+  if ! nft -c -f "$nft_file"; then
+    warn "the generated ruleset did not parse - any existing table was left untouched"
+    return 1
+  fi
+  nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+  nft -f "$nft_file" || return 1
+}
+
+teardown_rules() {
+  have nft || return 0
+  nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+}
+
+enable_forwarding() {
+  if [[ "$HOST_OS" == Darwin ]]; then
+    /usr/sbin/sysctl -w net.inet.ip.forwarding=1 >/dev/null
+    return
+  fi
+  sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || return 1
+}
+
+restore_forwarding() {
+  local prior="$1"
+  [[ -n "$prior" ]] || return 0
+  if [[ "$HOST_OS" == Darwin ]]; then
+    [[ "$prior" == 0 || "$prior" == 1 ]] || return 1
+    /usr/sbin/sysctl -w "net.inet.ip.forwarding=$prior" >/dev/null
+    return
+  fi
+  sysctl -qw net.ipv4.ip_forward="$prior" 2>/dev/null || return 1
+}
+
+# Darwin wg-quick records the kernel-assigned utun under the logical config name.
+live_wg_iface() { # <logical name>
+  local iface="$1" real listed
+  is_iface_name "$iface" || return 1
+  if [[ "$(uname -s)" == Darwin ]]; then
+    [[ -f "/var/run/wireguard/$iface.name" && ! -L "/var/run/wireguard/$iface.name" ]] || return 1
+    real="$(< "/var/run/wireguard/$iface.name")" || return 1
+    [[ "$real" =~ ^utun[0-9]+$ ]] && is_iface_name "$real" || return 1
+    [[ -S "/var/run/wireguard/$real.sock" && ! -L "/var/run/wireguard/$real.sock" ]] || return 1
+    listed="$(wg show interfaces 2>/dev/null)" || return 1
+    [[ " $listed " == *" $real "* ]] || return 1
+  else
+    ip link show dev "$iface" >/dev/null 2>&1 || return 1
+    real="$iface"
+  fi
+  printf '%s\n' "$real"
+}
+
+link_up() {
+  local iface="$1" conf real stripped
+  conf="$(server_conf_path)"
+  # Sync peers without dropping the interface. Don't pass an empty config to wg if strip fails.
+  if real="$(live_wg_iface "$iface")"; then
+    log "$iface already exists - syncing peers without dropping the link"
+    stripped="$(wg-quick strip "$conf")" && [[ -n "$stripped" ]] || return 1
+    wg syncconf "$real" /dev/stdin <<<"$stripped" || return 1
+    return 0
+  fi
+  wg-quick up "$conf" || return 1
+}
+
+link_down() {
+  local iface="$1" conf
+  conf="$(server_conf_path)"
+  if live_wg_iface "$iface" >/dev/null; then
+    if have wg-quick && [[ -e "$conf" ]] && wg-quick down "$conf" >/dev/null 2>&1; then
+      return 0
+    fi
+    # Only Linux has a direct link-delete fallback.
+    [[ "$(uname -s)" != Darwin ]] || return 1
+    ip link del "$iface" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# The directory holding the profiles must be owned by the OPERATOR, not by root: mode 700 is
+# right for private keys, but a root-owned 700 directory means the operator cannot even enter
+# it to read the profile they own, push it to a client, or open the PNG. Owned by the operator,
+# mode 700 gives the same protection against other users and keeps the output usable.
+prepare_outdir() { # <directory>
+  local dir="$1"
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" || return 1
+  chown_to_operator "$dir"
+  return 0
+}
+
+# Every value a CLIENT profile needs, resolved the same way `up` resolves it. A verb that writes a
+# profile later (add-client) must use the session's own values: rendering without them produces
+# `PublicKey = ` and `Endpoint = :51820`, which every client app rejects with "syntax error in Peer".
+load_client_render_context() {
+  local sf v priv subnet_from_state=0 mtu_from_state=0
+  sf="$(state_file)"
+  if [[ -r "$sf" ]]; then
+    v="$(state_get ENDPOINT "$sf" || true)";    if [[ -n "$v" ]]; then ENDPOINT="$v"; fi
+    v="$(state_get LISTEN_PORT "$sf" || true)"; if [[ -n "$v" ]]; then LISTEN_PORT="$v"; fi
+    v="$(state_get DNS "$sf" || true)";         if [[ -n "$v" ]]; then DNS="$v"; fi
+    v="$(state_get MTU "$sf" || true)";         if [[ -n "$v" ]]; then MTU="$v"; mtu_from_state=1; fi
+    v="$(state_get SUBNET "$sf" || true)";      if [[ -n "$v" ]]; then SUBNET="$v"; subnet_from_state=1; fi
+  fi
+  # No session state: the config on disk still says which subnet and MTU it was built with, and a new
+  # peer allocated from the DEFAULT subnet would sit outside the tunnel it is added to. Only values
+  # that pass the same checks `up` applies are adopted.
+  if ((subnet_from_state == 0)); then
+    v="$(conf_server_subnet "$(server_conf_path)" || true)"
+    if [[ "$v" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24$ ]]; then SUBNET="$v"; fi
+  fi
+  if ((mtu_from_state == 0)); then
+    v="$(conf_interface_value "$(server_conf_path)" MTU || true)"
+    if [[ "$v" =~ ^[0-9]+$ ]] && ((v >= 576 && v <= 1500)); then MTU="$v"; fi
+  fi
+  # The server public key is literally what the client dials: derived from the config the client will
+  # talk to, never left empty.
+  priv="$(conf_interface_privkey "$(server_conf_path)" || true)"
+  if [[ -n "$priv" ]]; then SERVER_PUBKEY="$(gen_pubkey "$priv")"; fi
+  # No session recorded at all: decide it exactly as `up` would (and say so if it cannot).
+  if [[ -z "$ENDPOINT" ]]; then
+    choose_default_endpoint || warn "could not determine the endpoint address for this profile"
+  fi
+  return 0
+}
+
+# A profile whose [Peer] has no usable PublicKey or Endpoint passes `wg-quick strip` (it does not
+# validate content) but is rejected by every client app, so it is checked before being written.
+client_profile_defect() { # <profile text> -> prints the defect, empty when the profile is usable
+  local body="$1"
+  if ! grep -qE '^PublicKey = [A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$' <<<"$body"; then
+    printf 'the [Peer] PublicKey is missing or is not a WireGuard key'
+    return 0
+  fi
+  if ! grep -qE '^Endpoint = [^:[:space:]]+:[0-9]+$' <<<"$body"; then
+    printf 'the Endpoint is missing or has no address before the port'
+    return 0
+  fi
+  printf ''
+}
+
+# Writes profiles for clients whose key was generated on this run. A reused client's private
+# key exists only in the profile already on disk, so that file is left exactly as it is.
+write_client_profiles() {
+  local i base_existed=1 body defect
+  NEW_PROFILE_COUNT=0
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 1 ]]; then NEW_PROFILE_COUNT=$((NEW_PROFILE_COUNT + 1)); fi
+  done
+  if ((NEW_PROFILE_COUNT == 0)); then return 0; fi
+
+  [[ -d "$OUT_BASE" ]] || base_existed=0
+  OUTDIR="$OUT_BASE/$(date -u +%Y%m%dT%H%M%SZ)"
+  prepare_outdir "$OUTDIR" || return 1
+  record_profile_dir "$OUTDIR"
+  # If this run created out/ itself, hand that over too: otherwise the operator cannot remove
+  # their own output without sudo.
+  if ((base_existed == 0)); then chown_to_operator "$OUT_BASE"; fi
+
+  for i in "${!CLIENT_NAMES[@]}"; do
+    [[ "${CLIENT_IS_NEW[$i]}" == 1 ]] || continue
+    body="$(render_client_conf "${CLIENT_ADDRS[$i]}" "${CLIENT_PRIVKEYS[$i]}")"
+    defect="$(client_profile_defect "$body")"
+    if [[ -n "$defect" ]]; then
+      die "refusing to write a client profile for ${CLIENT_NAMES[$i]}: $defect. Install wireguard-tools so the server key can be derived, then re-run" 1
+    fi
+    printf '%s\n' "$body" | write_atomic "$OUTDIR/${CLIENT_NAMES[$i]}.conf" 0600 || return 1
+    chown_to_operator "$OUTDIR/${CLIENT_NAMES[$i]}.conf"
+  done
+  return 0
+}
+
+# What the interception listener is actually bound to. A loopback-only listener receives
+# nothing from a redirect, and that failure looks like an idle app.
+proxy_bind_report() {
+  local addrs addr clean=1
+  addrs="$(burp_bind_addrs || true)"
+  printf '\nINTERCEPTION LISTENER\n'
+  if [[ -z "$addrs" ]]; then
+    printf '  WARN nothing is listening on TCP %s yet.\n' "$BURP_PORT"
+    printf '       Bind the proxy to 0.0.0.0 (or %s); a 127.0.0.1 listener would\n' "$(server_ip)"
+    printf '       blackhole every redirected request.\n'
+    return 1
+  fi
+  while read -r addr; do
+    [[ -z "$addr" ]] && continue
+    case "$addr" in
+      127.0.0.1 | ::1)
+        printf '  FAIL the proxy listens on %s:%s only - redirected traffic is sent to\n' "$addr" "$BURP_PORT"
+        printf '       %s and dropped. Rebind the listener to 0.0.0.0.\n' "$(server_ip)"
+        clean=0
+        ;;
+      *)
+        printf '  OK   proxy listening on %s:%s\n' "$addr" "$BURP_PORT"
+        ;;
+    esac
+  done <<<"$addrs"
+  [[ "$clean" == 1 ]]
+}
+
+print_qr() {
+  local conf="$1"
+  if have qrencode; then
+    printf '\nQR - scan from the WireGuard app (%s)\n' "$conf"
+    qrencode -t ANSIUTF8 <"$conf" || warn "qrencode failed; import the .conf file instead"
+  else
+    warn "qrencode not installed - import the profile as a file instead:"
+    printf '       adb push %s /sdcard/Download/\n' "$conf"
+    printf '       (the WireGuard app imports .conf files from storage)\n'
+  fi
+}
+
+print_profile_hint() {
+  local i target=""
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 1 ]]; then
+      target="$OUTDIR/${CLIENT_NAMES[$i]}.conf"
+      break
+    fi
+  done
+  if [[ -z "$target" ]]; then
+    for i in "${!CLIENT_NAMES[@]}"; do
+      if [[ -n "${OUTDIR:-}" && -e "$OUTDIR/${CLIENT_NAMES[$i]}.conf" ]]; then
+        target="$OUTDIR/${CLIENT_NAMES[$i]}.conf"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$target" ]]; then
+    print_qr "$target"
+    return 0
+  fi
+  if [[ -n "$(missing_profile_names)" ]]; then
+    # Do not claim "a device that already imported one needs nothing": for these peers nothing
+    # exists to import, so the honest answer is how to get a usable profile.
+    printf '\nPROFILES\n'
+    printf '  every peer was reused, but no profile for %s is on this machine, so there is\n' \
+      "$(missing_profile_names)"
+    printf '  nothing to import or print. Give one a new key:\n'
+    printf '    sudo %s remove-client <name> && sudo %s add-client <name>\n' "$PROG" "$PROG"
+    return 0
+  fi
+  printf '\nPROFILES\n'
+  printf '  every peer was reused, so no profile was rewritten - a device that already\n'
+  printf '  imported one needs nothing. Reprint any of them with:  %s qr <name>\n' "$PROG"
+}
+
+print_up_summary() {
+  local i
+  printf '\n%s%s%s\n' "$C_BOLD" "tunnel is up" "$C_RESET"
+  printf '  interface      %s (%s)\n' "$IFACE" "$(server_addr)"
+  printf '  listening      udp %s\n' "$LISTEN_PORT"
+  if [[ "$HOST_OS" == Darwin ]]; then
+    printf '  rules          PF anchor %s\n' "$(pf_anchor)"
+  else
+    printf '  rules          table inet %s   (inspect: nft list table inet %s)\n' "$NFT_TABLE" "$NFT_TABLE"
+  fi
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    printf '  interception   tcp from %s -> :%s\n' "$SUBNET" "$BURP_PORT"
+  else
+    printf '  interception   disabled (--no-proxy)\n'
+  fi
+  printf '  ip_forward     %s (prior value %s)\n' "$(current_ip_forward)" "${PRIOR_IP_FORWARD:-?}"
+  printf '  ipv6           not carried: rejected inside the tunnel, so apps fall back to IPv4\n'
+  printf '                 instead of waiting on a black hole or leaking around the interception\n'
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 1 ]]; then
+      printf '  profile        %s/%s.conf  (%s/32, owner %s)\n' \
+        "$OUTDIR" "${CLIENT_NAMES[$i]}" "${CLIENT_ADDRS[$i]}" "${SUDO_USER:-root}"
+    else
+      printf '  peer reused    %-12s %s/32  (profile left alone)\n' \
+        "${CLIENT_NAMES[$i]}" "${CLIENT_ADDRS[$i]}"
+    fi
+  done
+  if (($(reused_client_count) > 0)); then
+    printf '  note           a reused profile keeps the --dns/--mtu/--endpoint it was built\n'
+    printf '                 with. If you changed any of those, re-import: %s qr <name>\n' "$PROG"
+  fi
+  if [[ -n "$(unrequested_peer_names)" ]]; then
+    printf '  note           kept from the previous session because this run did not ask for\n'
+    printf '                 them: %s   (remove: %s remove-client <name>)\n' \
+      "$(unrequested_peer_names)" "$PROG"
+  fi
+  if [[ -n "$(missing_profile_names)" ]]; then
+    warn "these peers are in the config but their profiles are not on this machine: $(missing_profile_names)"
+    warn "  a peer's private key exists ONLY in its profile file, so it cannot be imported or"
+    warn "  QR-printed as it stands. Give one a new key:"
+    warn "    sudo $PROG remove-client <name> && sudo $PROG add-client <name>"
+    warn "  (or regenerate everything, which breaks already-imported devices:  sudo $PROG up --fresh)"
+  fi
+  proxy_bind_report || true
+  print_client_checklist
+  printf '\nNEXT\n'
+  printf '  1. import the profile on the client:  %s qr %s\n' "$PROG" "${CLIENT_NAMES[0]}"
+  printf '  2. watch the handshake land:         %s wait\n' "$PROG"
+  printf '  3. tear everything down:             sudo %s down\n' "$PROG"
+}
+
+apply_up() {
+  ensure_root
+  # Refuse an unsafe config directory before writing anything at all.
+  assert_conf_dir_safe
+  local darwin_repeat=0
+  if [[ "$HOST_OS" == Darwin ]]; then
+    darwin_prepare_up
+    if [[ -e "$(state_file)" ]]; then darwin_repeat=1; fi
+  else
+    PRIOR_IP_FORWARD="$(current_ip_forward)"
+  fi
+  # A repeat run must NOT overwrite the value recorded by the first one: this tool enabled
+  # forwarding itself, so reading it now would record "1" as the prior value and the next `down`
+  # would leave forwarding on for good. Only adopt the record while our own link is still up, which
+  # is what makes the current "1" ours rather than somebody else's.
+  if [[ "$HOST_OS" != Darwin ]] && live_wg_iface "$IFACE" >/dev/null; then
+    local recorded_prior
+    recorded_prior="$(state_get PRIOR_IP_FORWARD "$(state_file)" 2>/dev/null || true)"
+    if [[ -n "$recorded_prior" && "$recorded_prior" != "$PRIOR_IP_FORWARD" ]]; then
+      log "keeping the forwarding value recorded by the session in effect (prior was $recorded_prior, not $PRIOR_IP_FORWARD)"
+      PRIOR_IP_FORWARD="$recorded_prior"
+    fi
+  fi
+
+  # A repeat `up` must not erase what the first one recorded: the state file is rewritten wholesale
+  # below, and the earlier backups plus any firewall fix are exactly what `down` and `--purge` need to
+  # undo. Adopt them before the first write, and never overwrite a value this run has already set.
+  local sf_prev prev
+  sf_prev="$(state_file)"
+  if [[ -r "$sf_prev" ]]; then
+    if (( ${#BACKUPS[@]} == 0 )); then
+      prev="$(state_get BACKUPS "$sf_prev" || true)"
+      if [[ -n "$prev" ]]; then read -r -a BACKUPS <<<"$prev"; fi
+    fi
+    if [[ -z "$FIREWALL_FIX" ]]; then
+      FIREWALL_FIX="$(state_get FIREWALL_FIX "$sf_prev" || true)"
+    fi
+  fi
+
+  # Client profiles first: cheap, and it fails before anything on the system changes.
+  write_client_profiles || die "could not write client profiles to $OUT_BASE" 1
+  if ((NEW_PROFILE_COUNT == 0)); then
+    # Nothing new was written: keep pointing the session at the existing profiles.
+    OUTDIR="$(session_outdir)"
+    if [[ -z "$OUTDIR" ]]; then OUTDIR="$(newest_outdir)"; fi
+    # Only claim the directory when it is actually there: a recorded path can outlive its contents,
+    # and saying "existing ones are in X" for a directory that is gone is how the operator ends up
+    # trusting a location that holds nothing.
+    if [[ -n "$OUTDIR" && -d "$OUTDIR" ]]; then
+      log "no new profiles; existing ones are in $OUTDIR"
+      record_profile_dir "$OUTDIR"
+    fi
+  fi
+
+  # Record what teardown will need BEFORE anything is changed. If this process is killed
+  # between here and the end, the state file still exists and `wgb down` can restore forwarding
+  # and remove the table; writing it last leaves a machine with ip_forward=1 and no record of it.
+  ensure_state_dir || die "could not create the state directory $STATE_DIR" 1
+  render_state_file | write_atomic "$(state_file)" 0600 ||
+    die "could not write session state to $(state_file)" 1
+
+  backup_config || die "could not back up $(server_conf_path)" 1
+  ensure_etc_dir "$WG_ETC_DIR" || die "could not create the config directory $WG_ETC_DIR" 1
+  render_server_conf | write_atomic "$(server_conf_path)" 0600 ||
+    die "could not write $(server_conf_path)" 1
+
+  # Second write: backup_config has now recorded whatever backup it made, and teardown needs to
+  # know about it so `--purge` removes that key material too.
+  render_state_file | write_atomic "$(state_file)" 0600 ||
+    warn "could not update session state with the backup list"
+
+  if [[ "$HOST_OS" == Darwin ]]; then
+    if (( darwin_repeat )); then
+      link_up "$IFACE" || die 'WireGuard sync failed; the running PF anchor was left in place.' 1
+    elif ! { link_up "$IFACE" && pf_start && enable_forwarding; }; then
+      if darwin_network_down "$PRIOR_IP_FORWARD"; then
+        die 'macOS bring-up failed; network changes were rolled back. Run sudo wgb down before retrying.' 1
+      fi
+      die 'macOS bring-up and rollback failed; state was kept. Run sudo wgb down before retrying.' 1
+    fi
+    print_up_summary
+    print_profile_hint
+    return 0
+  fi
+
+  if ! load_rules; then
+    warn "failed to load the nft ruleset; run 'sudo $PROG down' to clear the session state"
+    exit 1
+  fi
+  if ! enable_forwarding; then
+    warn "could not enable net.ipv4.ip_forward - rolling back rules"
+    teardown_rules
+    exit 1
+  fi
+  if ! link_up "$IFACE"; then
+    warn "could not bring $IFACE up - rolling back rules and forwarding"
+    teardown_rules
+    restore_forwarding "$PRIOR_IP_FORWARD" || true
+    exit 1
+  fi
+
+  # Another firewall's DROP policy is the one thing that produces "handshake OK, nothing loads" while
+  # every check here passes. Ask ufw for the allowance it needs; the record of it is written to the
+  # state below so `down` removes exactly that (and nothing the user added themselves).
+  fix_forward_drop
+  if [[ -n "$FIREWALL_FIX" ]]; then
+    render_state_file | write_atomic "$(state_file)" 0600 ||
+      warn "could not record the firewall fix in the session state; remove it by hand if 'down' does not"
+  fi
+
+  print_up_summary
+  print_profile_hint
+}
+
+apply_down() {
+  ensure_root
+  local sf iface prior outdir backups did=0 purged_outdir=0 fix="" left_dirs
+
+  sf="$(state_file)"
+  iface="$IFACE"
+  if [[ -r "$sf" ]]; then
+    iface="$(state_get IFACE "$sf" || printf '%s' "$IFACE")"
+    # The state file is data, not code: a recorded value that is not a plausible interface name is
+    # ignored rather than used to build paths and command arguments.
+    if ! is_iface_name "$iface"; then
+      warn "ignoring an unusable interface name recorded in $sf: $iface"
+      iface="$IFACE"
+    fi
+    prior="$(state_get PRIOR_IP_FORWARD "$sf" || true)"
+    outdir="$(state_get OUTDIR "$sf" || true)"
+    backups="$(state_get BACKUPS "$sf" || true)"
+    fix="$(state_get FIREWALL_FIX "$sf" || true)"
+  else
+    prior=""
+    outdir=""
+    backups=""
+    fix=""
+  fi
+
+  if [[ "$HOST_OS" == Darwin ]]; then
+    if [[ -e "$sf" ]]; then
+      [[ "$iface" == "$IFACE" && ( "$prior" == 0 || "$prior" == 1 ) ]] ||
+        die 'Invalid macOS session state; no network changes made.' 1
+      darwin_network_down "$prior" || die 'macOS cleanup incomplete; session state kept. Retry sudo wgb down.' 1
+      did=1
+    fi
+  else
+    if live_wg_iface "$iface" >/dev/null; then
+      log "bringing down $iface"
+      link_down "$iface"
+      did=1
+    fi
+    if have nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+      log "removing table inet $NFT_TABLE (single atomic operation)"
+      teardown_rules
+      did=1
+    fi
+    if [[ -n "$prior" ]]; then
+      if restore_forwarding "$prior"; then
+        log "restored net.ipv4.ip_forward=$prior"
+      else
+        warn "could not restore net.ipv4.ip_forward to $prior"
+      fi
+      did=1
+    fi
+  fi
+
+  # Undo the firewall rule this session added, and only that one: the record is what makes it safe to
+  # touch a configuration file owned by another tool.
+  if [[ -n "$fix" ]]; then
+    undo_forward_drop_fix "$fix"
+    did=1
+  fi
+
+  # Anything an EARLIER session recorded durably and never reverted - the state file does not survive a
+  # reboot, so without this a `down` after a reboot is a no-op that leaves a firewall rule behind.
+  local pending
+  pending="$(recorded_undos_of ufw-route || true)"
+  if [[ -n "$pending" ]]; then
+    while IFS= read -r subnet; do
+      if [[ -n "$subnet" ]]; then
+        undo_forward_drop_fix "ufw-route:$subnet"
+        did=1
+      fi
+    done <<<"$pending"
+  fi
+
+  if [[ "$PURGE" == 1 ]]; then
+    if [[ -e "$(server_conf_path)" ]]; then
+      rm -f "$(server_conf_path)"
+      log "removed $(server_conf_path)"
+    fi
+    rm -f "$sf"
+    # Backups created by this session hold the same keys as the config, so purge removes exactly
+    # the ones accounted for - the session record plus the durable one (an earlier session's backups
+    # outlive the reboot that clears /run) - and only if the path still looks like our own backup.
+    while IFS= read -r b; do
+      [[ -n "$b" ]] || continue
+      case "$b" in
+        *.conf.bak-[0-9]*)
+          if [[ -e "$b" ]]; then
+            rm -f "$b"
+            log "removed backup $b"
+          fi
+          forget_undo "backup:$b"
+          ;;
+        *) warn "not removing unexpected backup path recorded in state: $b" ;;
+      esac
+    done < <(accounted_backups "$backups")
+    # Recursion safety: only remove a directory that sits directly under the output base AND
+    # carries the timestamp name this tool generates. `--purge` promises to remove the profiles,
+    # so keying this off a literal directory name would break that promise for any other base.
+    if [[ -n "$outdir" && -d "$outdir" ]] &&
+      [[ "$outdir" == "$OUT_BASE"/* ]] &&
+      [[ "$(basename "$outdir")" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+      rm -rf "$outdir"
+      purged_outdir=1
+      log "purged config, state and $outdir"
+    elif [[ -n "$outdir" && -d "$outdir" ]]; then
+      warn "not removing $outdir - it is not a directory this tool generated"
+    fi
+    # `rmdir` cannot remove a non-empty directory, so a base that still holds anything else stays.
+    if ((purged_outdir == 1)) && [[ -n "$OUT_BASE" ]]; then
+      if rmdir "$OUT_BASE" 2>/dev/null; then
+        log "removed empty $OUT_BASE"
+      fi
+    fi
+    # If the base survived, it still holds something - often an EARLIER session's profile directory,
+    # because a purge removes this session's artifacts and each session writes its own. A profile is
+    # key material, so silence here would defeat the point of a purge.
+    if [[ -d "$OUT_BASE" ]]; then
+      left_dirs="$(list_profile_dirs "$OUT_BASE" || true)"
+      if [[ -n "$left_dirs" ]]; then
+        warn "the output base still holds profile directories this session did not write:"
+        while IFS= read -r d; do
+          if [[ -n "$d" ]]; then warn "  $d"; fi
+        done <<<"$left_dirs"
+        warn "  they contain client private keys - the purge removes this session's profiles only"
+      fi
+    fi
+    did=1
+  else
+    rm -f "$sf"
+    # A backup holds the same private keys as the config. `down` keeps it on purpose, but the
+    # operator should know it is still on disk rather than discover it months later - including one
+    # an earlier session made, which a reboot removed the session record of.
+    local b_left
+    b_left="$(accounted_backups "$backups")"
+    if [[ -n "$b_left" ]]; then
+      warn "config backups were left in place - they hold the same private keys as the config:"
+      while IFS= read -r b; do
+        if [[ -n "$b" ]]; then warn "  $b"; fi
+      done <<<"$b_left"
+      warn "remove them with: sudo $PROG down --purge   (or delete them yourself)"
+    fi
+  fi
+
+  # Working files this session created must not outlive it: the rendered ruleset is ours and is
+  # regenerated on every up. `rmdir` then tidies the state directory when nothing else is tracked.
+  rm -f "$STATE_DIR/$iface.nft" 2>/dev/null || true
+  rmdir "$STATE_DIR" 2>/dev/null || true
+
+  if [[ "$did" == 0 ]]; then
+    log "nothing to tear down"
+  fi
+  printf 'tunnel down: interface, rules and forwarding restored\n'
+}
+
+# ------------------------------------------------------- client inventory ---
+# Peers are read back out of the server config rather than from a private bookkeeping
+# file: the config is what wg-quick actually loads, so it is the only source of truth
+# that cannot drift. Client names live in the `# client: <name>` comments the tool writes.
+conf_peers() { # <server conf> -> "name<TAB>address<TAB>pubkey" lines
+  local file="$1"
+  [[ -r "$file" ]] || return 0
+  awk '
+    function clean(s) { sub(/^[^=]*=[ \t]*/, "", s); return s }
+    /^\[Interface\]/ { section = "iface"; next }
+    /^\[Peer\]/ { section = "peer"; name = ""; pub = ""; next }
+    section != "peer" { next }
+    /^# client:/ { name = $0; sub(/^# client:[ \t]*/, "", name); sub(/[ \t]+$/, "", name); next }
+    /^PublicKey/ { pub = clean($0); next }
+    /^AllowedIPs/ {
+      addr = clean($0)
+      # A peer line may carry several entries (IPv4 plus the IPv6 ULA of the client); inventory and
+      # address allocation care about the IPv4 one only.
+      sub(/,.*$/, "", addr)
+      sub(/\/[0-9]+$/, "", addr)
+      if (name == "" && addr != "") name = "_unnamed_" addr
+      print name "\t" addr "\t" pub
+      name = ""; pub = ""; addr = ""
+    }
+  ' "$file"
+}
+
+# One key out of an existing config's [Interface] section. Used when no session state survives (a
+# plain `down` deletes it, a reboot clears /run): the config on disk is then the only record of the
+# subnet and MTU the peers in it were built with.
+conf_interface_value() { # <conf> <key>
+  local file="$1" key="$2" line
+  [[ -r "$file" ]] || return 1
+  line="$(awk -v k="$key" '
+    /^\[Interface\]/ { iface = 1; next }
+    /^\[Peer\]/ { iface = 0 }
+    iface && $1 == k { sub(/^[^=]*=[ \t]*/, ""); print; exit }
+  ' "$file")"
+  [[ -n "$line" ]] || return 1
+  printf '%s' "$line"
+}
+
+# The subnet a config's own peers live in, from its [Interface] Address (x.y.z.0/24).
+conf_server_subnet() { # <conf>
+  local addr
+  addr="$(conf_interface_value "$1" Address || true)"
+  [[ -n "$addr" ]] || return 1
+  addr="${addr%%,*}"
+  printf '%s' "$addr" | awk -F'[./]' 'NF >= 4 { printf "%s.%s.%s.0/24\n", $1, $2, $3 }'
+}
+
+# Server private key from an existing config, if it has one.
+conf_interface_privkey() { # <conf>
+  local file="$1" line
+  [[ -r "$file" ]] || return 1
+  line="$(awk '
+    /^\[Interface\]/ { iface = 1; next }
+    /^\[Peer\]/ { iface = 0 }
+    iface && /^PrivateKey/ { sub(/^[^=]*=[ \t]*/, ""); print; exit }
+  ' "$file")"
+  [[ -n "$line" ]] || return 1
+  printf '%s' "$line"
+}
+
+# Index of NAME in CLIENT_NAMES, or non-zero if it is not there.
+name_index() {
+  local want="$1" i
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_NAMES[$i]}" == "$want" ]]; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+humanize_age() {
+  local ts="$1" diff
+  if ! [[ "$ts" =~ ^[0-9]+$ ]] || ((ts == 0)); then
+    printf 'never'
+    return 0
+  fi
+  diff=$(( $(date +%s) - ts ))
+  if ((diff < 5)); then
+    printf 'just now'
+  elif ((diff < 60)); then
+    printf '%ds ago' "$diff"
+  elif ((diff < 3600)); then
+    printf '%dm ago' "$((diff / 60))"
+  elif ((diff < 86400)); then
+    printf '%dh ago' "$((diff / 3600))"
+  else
+    printf '%dd ago' "$((diff / 86400))"
+  fi
+}
+
+# Where this session's client profiles live, from the recorded session if there is one.
+# Read-only on purpose: looking a profile up must not create directories.
+session_outdir() {
+  if [[ -z "${OUTDIR:-}" ]]; then
+    local sf
+    sf="$(state_file)"
+    if [[ -r "$sf" ]]; then OUTDIR="$(state_get OUTDIR "$sf" || true)"; fi
+  fi
+  printf '%s' "${OUTDIR:-}"
+}
+
+# Where profiles should be written: the session's directory, or a fresh timestamped one.
+ensure_outdir() {
+  local dir
+  dir="$(session_outdir)"
+  if [[ -z "$dir" ]]; then dir="$OUT_BASE/$(date -u +%Y%m%dT%H%M%SZ)"; fi
+  OUTDIR="$dir"
+  prepare_outdir "$OUTDIR" || return 1
+  return 0
+}
+
+# Most recent existing profile directory under OUT_BASE, for a re-run that writes nothing
+# new and still needs to know where the profiles from earlier runs live.
+newest_outdir() {
+  local files=() f newest=""
+  shopt -s nullglob
+  files=("$OUT_BASE"/*/)
+  shopt -u nullglob
+  for f in "${files[@]}"; do
+    if [[ -z "$newest" || "$f" -nt "$newest" ]]; then newest="$f"; fi
+  done
+  printf '%s' "${newest%/}"
+}
+
+# Profile directories under a base that still hold at least one client profile.
+list_profile_dirs() { # <base>
+  local d f
+  shopt -s nullglob
+  for d in "$1"/*/; do
+    for f in "$d"*.conf; do
+      [[ -e "$f" ]] || continue
+      printf '%s\n' "${d%/}"
+      break
+    done
+  done
+  shopt -u nullglob
+  return 0
+}
+
+chown_to_operator() {
+  local path="$1" owner="${SUDO_USER:-root}"
+  if [[ "$owner" != root ]] && have chown; then
+    chown "$owner" "$path" 2>/dev/null || warn "could not chown $path to $owner"
+  fi
+}
+
+# The client profiles present in a directory, for an error message that says what IS available
+# instead of only what is not.
+list_profile_names() { # <directory>
+  local f out=""
+  shopt -s nullglob
+  for f in "$1"/*.conf; do out+="$(basename "$f" .conf) "; done
+  shopt -u nullglob
+  printf '%s' "${out% }"
+}
+
+# Prove a candidate config still parses before installing it. wg-quick insists the file be
+# named <iface>.conf, hence the throwaway directory. wg-quick re-execs itself through sudo
+# when run unprivileged, so without root the check is skipped rather than failed: it can
+# only ever be called from a code path that already required root.
+validate_wg_conf() { # <candidate file> <iface>
+  local file="$1" iface="$2" dir tmp rc=0
+  have wg-quick || return 0
+  (( $(id -u) == 0 )) || return 0
+  dir="$(mktemp -d)" || return 0
+  tmp="$dir/$iface.conf"
+  if cp "$file" "$tmp" 2>/dev/null; then
+    chmod 600 "$tmp"
+    wg-quick strip "$tmp" >/dev/null 2>&1 || rc=1
+  fi
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# Filter one peer block out of a server config, writing the result to stdout.
+remove_peer() { # <conf> <name>
+  local conf="$1" want="$2"
+  awk -v want="$want" '
+    function flush() {
+      if (block != "" && keep) printf "%s", block
+      block = ""; keep = 1
+    }
+    /^\[Interface\]/ { flush(); section = "iface"; print; next }
+    /^\[Peer\]/ { flush(); section = "peer"; block = $0 "\n"; next }
+    {
+      if (section == "peer") {
+        block = block $0 "\n"
+        if ($0 ~ /^# client:[ \t]*/) {
+          n = $0; sub(/^# client:[ \t]*/, "", n); sub(/[ \t]+$/, "", n)
+          if (n == want) keep = 0
+        }
+      } else {
+        print
+      }
+    }
+    END { flush() }
+  ' "$conf"
+}
+
+# Reads the COMPLETE replacement server config from stdin and installs it atomically.
+# Anything else (a single peer block, a fragment) would silently truncate the config, so
+# an incomplete replacement is refused here rather than after it has been installed.
+install_conf_from_stdin() {
+  local conf tmp
+  conf="$(server_conf_path)"
+  tmp="$(dirname "$conf")/.$(basename "$conf").new.$$"
+  (umask 077; cat >"$tmp") || return 1
+  chmod 600 "$tmp"
+  if ! grep -q '^\[Interface\]' "$tmp"; then
+    rm -f "$tmp"
+    warn "refusing to install a config with no [Interface] section (incomplete replacement)"
+    return 1
+  fi
+  if ! validate_wg_conf "$tmp" "$IFACE"; then
+    rm -f "$tmp"
+    warn "the modified config did not pass 'wg-quick strip' - server config left untouched"
+    return 1
+  fi
+  mv -f "$tmp" "$conf"
+}
+
+# -------------------------------------------------------------- client verbs ---
+cmd_list() {
+  local conf peers hs name addr pub handshake real count=0
+  conf="$(server_conf_path)"
+
+  if [[ ! -e "$conf" ]]; then
+    log "no server config at $conf - bring the tunnel up first: sudo $PROG up"
+    return 0
+  fi
+  if [[ ! -r "$conf" ]]; then
+    log "cannot read $conf - re-run with sudo to list peers"
+    return 0
+  fi
+
+  peers="$(conf_peers "$conf")"
+  if [[ -z "$peers" ]]; then
+    log "$conf has no peers yet - add one: sudo $PROG add-client tablet"
+    return 0
+  fi
+
+  hs=""
+  if [[ "$(id -u)" == 0 ]] && have wg && real="$(live_wg_iface "$IFACE")"; then
+    hs="$(wg show "$real" latest-handshakes 2>/dev/null || true)"
+  fi
+
+  printf 'PEERS in %s\n\n' "$conf"
+  printf '  %-14s %-16s %s\n' NAME ADDRESS 'LAST HANDSHAKE'
+  while IFS=$'\t' read -r name addr pub; do
+    [[ -n "$addr" ]] || continue
+    count=$((count + 1))
+    handshake="-"
+    if [[ -n "$hs" && -n "$pub" ]]; then
+      local ts
+      ts="$(printf '%s\n' "$hs" | awk -v k="$pub" '$1 == k { print $2 }')"
+      handshake="$(humanize_age "$ts")"
+    elif [[ -z "$hs" ]]; then
+      handshake='? (needs root)'
+    fi
+    printf '  %-14s %-16s %s\n' "$name" "$addr/32" "$handshake"
+  done <<<"$peers"
+  printf '\n  %d peer(s)\n' "$count"
+  printf '  profiles in: %s\n' "$(find_profile_dir | grep . || printf 'none found under %s' "$OUT_BASE")"
+}
+
+cmd_add_client() {
+  local name="${EXTRA[0]:-}"
+  [[ -n "$name" ]] || die "add-client needs a name, e.g. $PROG add-client tablet" 2
+  [[ "$name" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] ||
+    die "client name must match [a-zA-Z0-9_-]{1,32} (got: $name)" 2
+  validate_config
+  ensure_root
+
+  local conf existing addr name_seen priv pub newaddr
+  conf="$(server_conf_path)"
+  assert_conf_dir_safe
+  [[ -r "$conf" ]] ||
+    die "no server config at $conf - bring the tunnel up first: sudo $PROG up" 1
+  # The session's own values, so this profile matches the tunnel the client will talk to (and so the
+  # new address is allocated inside the session's subnet rather than the default one).
+  load_client_render_context
+
+  existing=()
+  # Address and name are both taken from the config that is actually loaded.
+  while IFS=$'\t' read -r name_seen addr _; do
+    [[ -n "$addr" ]] || continue
+    existing+=("$addr")
+    [[ "$name_seen" == "$name" ]] &&
+      die "client '$name' already exists at $addr - remove it first or pick another name" 1
+  done < <(conf_peers "$conf")
+
+  newaddr="$(alloc_next_ip "${existing[@]:-}")" ||
+    die "no free address left in $SUBNET" 1
+  priv="$(gen_privkey)"
+  pub="$(gen_pubkey "$priv")"
+
+  # Existing config plus the new peer block: install_conf_from_stdin replaces the file
+  # wholesale, so the current contents have to be part of what it receives.
+  {
+    cat "$conf"
+    printf '\n[Peer]\n# client: %s\nPublicKey = %s\nAllowedIPs = %s/32\n' "$name" "$pub" "$newaddr"
+  } | install_conf_from_stdin || die "could not add $name to $conf" 1
+  log "added peer '$name' at $newaddr/32 to $conf"
+
+  # Push it to the running interface if there is one; a new client should not have to wait
+  # for a reconnect cycle.
+  if have wg && live_wg_iface "$IFACE" >/dev/null; then
+    if link_up "$IFACE"; then
+      log "live interface synced - the new client can connect now"
+    else
+      warn "peer added to the config, but syncing $IFACE failed:"
+      warn "  sudo wg syncconf $IFACE <(wg-quick strip $conf)"
+    fi
+  else
+    log "tunnel is not up: the peer takes effect on the next 'sudo $PROG up'"
+  fi
+
+  ensure_outdir || die "could not prepare $OUT_BASE" 1
+  record_profile_dir "$OUTDIR"
+  local body defect
+  body="$(render_client_conf "$newaddr" "$priv")"
+  defect="$(client_profile_defect "$body")"
+  if [[ -n "$defect" ]]; then
+    die "refusing to write $OUTDIR/$name.conf: $defect. Install wireguard-tools so the server key can be derived, then re-run" 1
+  fi
+  printf '%s\n' "$body" | write_atomic "$OUTDIR/$name.conf" 0600 ||
+    die "could not write $OUTDIR/$name.conf" 1
+  chown_to_operator "$OUTDIR/$name.conf"
+
+  printf "\nclient '%s' ready: %s/%s.conf  (%s/32)\n" "$name" "$OUTDIR" "$name" "$newaddr"
+  printf 'import it with:  %s qr %s\n' "$PROG" "$name"
+}
+
+cmd_remove_client() {
+  local name="${EXTRA[0]:-}"
+  [[ -n "$name" ]] || die "remove-client needs a name (see: $PROG list)" 2
+  ensure_root
+
+  local conf found
+  conf="$(server_conf_path)"
+  assert_conf_dir_safe
+  [[ -r "$conf" ]] || die "no server config at $conf" 1
+
+  found="$(conf_peers "$conf" | awk -F'\t' -v n="$name" '$1 == n { print "yes" }')"
+  [[ -n "$found" ]] || die "no peer named '$name' in $conf (see: $PROG list)" 1
+
+  # Piped straight into the installer: a copy of the config on disk would be a second file holding
+  # the server private key, and an interrupted run would leave it there.
+  if ! remove_peer "$conf" "$name" | install_conf_from_stdin; then
+    die "refusing to install an invalid config - $conf is unchanged" 1
+  fi
+  log "removed peer '$name' from $conf"
+
+  if have wg && live_wg_iface "$IFACE" >/dev/null; then
+    if link_up "$IFACE"; then
+      log "live interface synced - that client can no longer connect"
+    else
+      warn "removed from the config, but syncing $IFACE failed"
+    fi
+  fi
+
+  # The profile may live in an EARLIER session's directory (each session writes its own), so it is
+  # looked up across every place we search - by name, because the peer is already gone from the config
+  # and its key can no longer be matched. Leaving it behind leaves a profile on disk for a peer that
+  # no longer exists, and `qr` would happily print it.
+  local pdir
+  if pdir="$(find_profile_for "$name")" && [[ -n "$pdir" && -e "$pdir/$name.conf" ]]; then
+    rm -f "$pdir/$name.conf" "$pdir/$name.conf.png"
+    log "removed profile $pdir/$name.conf"
+  fi
+}
+
+# --------------------------------------------------------- profile index ---
+# Profiles have to stay findable: the session state is deleted by a plain `down` and by a reboot, and
+# the output base defaults to $PWD/out, so a `qr` run from another directory would otherwise never
+# find a profile that exists. Only directory PATHS are recorded here - never key material - so the
+# file is readable on purpose: an unprivileged `qr` can then find the operator's own profiles.
+profile_index_file() { printf '%s/profile-dirs' "$INDEX_DIR"; }
+
+record_profile_dir() { # <directory>
+  local dir="$1" f tmp
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  f="$(profile_index_file)"
+  mkdir -p "$INDEX_DIR" 2>/dev/null || return 0
+  chmod 755 "$INDEX_DIR" 2>/dev/null || true
+  tmp="$(mktemp "$f.XXXXXX" 2>/dev/null)" || return 0
+  { grep -vx "$dir" "$f" 2>/dev/null || true; printf '%s\n' "$dir"; } | tail -n 20 >"$tmp"
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" 2>/dev/null || true
+  return 0
+}
+
+# Recorded directories, most recently recorded first.
+recorded_profile_dirs() {
+  local f
+  f="$(profile_index_file)"
+  [[ -r "$f" ]] || return 0
+  awk '{ lines[NR] = $0 } END { for (i = NR; i > 0; i--) print lines[i] }' "$f"
+}
+
+# The places a profile may live, in search order: the session's directory, the recorded history, then
+# the newest directory under the output base. The trailing printf matters: `newest_outdir` prints no
+# newline and a `while read` consumer drops a final line that has none.
+profile_search_dirs() {
+  printf '%s\n' "$(session_outdir)"
+  recorded_profile_dirs
+  newest_outdir
+  printf '\n'
+}
+
+# The public key a profile's private key corresponds to, or nothing when it cannot be derived.
+profile_pubkey() { # <profile file>
+  local priv
+  have wg || return 1
+  priv="$(awk '/^PrivateKey[ \t]*=/ { sub(/^[^=]*=[ \t]*/, ""); print; exit }' "$1")"
+  [[ -n "$priv" ]] || return 1
+  printf '%s' "$priv" | wg pubkey 2>/dev/null
+}
+
+# The public key the live config has for <name>, or nothing.
+peer_pubkey() { # <name>
+  local conf
+  conf="$(server_conf_path)"
+  [[ -r "$conf" ]] || return 1
+  conf_peers "$conf" | awk -F'\t' -v n="$1" '$1 == n { print $3; exit }'
+}
+
+# Where the profiles live, for READ-ONLY verbs.
+find_profile_dir() {
+  local dir
+  while read -r dir; do
+    if [[ -n "$dir" && -d "$dir" ]]; then printf '%s' "$dir"; return 0; fi
+  done < <(profile_search_dirs)
+  return 0
+}
+
+# The directory holding a profile for <name>. When the live config knows that peer's public key, only
+# a profile whose private key matches it counts: an older profile left over from a peer that was since
+# regenerated would import a device that can never complete a handshake - worse than saying so.
+find_profile_for() { # <name>
+  local name="$1" dir want="" use_key=0
+  want="$(peer_pubkey "$name" 2>/dev/null || true)"
+  if [[ -n "$want" ]] && have wg; then use_key=1; fi
+  while read -r dir; do
+    [[ -n "$dir" && -e "$dir/$name.conf" ]] || continue
+    if ((use_key == 1)); then
+      [[ "$(profile_pubkey "$dir/$name.conf" || true)" == "$want" ]] || continue
+    fi
+    printf '%s' "$dir"
+    return 0
+  done < <(profile_search_dirs)
+  return 1
+}
+
+# Everywhere a profile could have been, for an error message that tells the operator where to look.
+searched_dirs() {
+  local dir out=""
+  while read -r dir; do
+    [[ -n "$dir" ]] || continue
+    case " $out " in *" $dir "*) continue ;; esac
+    out+="$dir "
+  done < <(profile_search_dirs)
+  case " $out " in *" $OUT_BASE "*) ;; *) out+="$OUT_BASE " ;; esac
+  printf '%s' "${out% }"
+}
+
+peer_in_config() { # <name>
+  local conf
+  conf="$(server_conf_path)"
+  [[ -r "$conf" ]] || return 1
+  conf_peers "$conf" | awk -F'\t' -v n="$1" '$1 == n { found = 1 } END { exit !found }'
+}
+
+# Profile names present across the places we search, so a "no profile for X" message can say what
+# does exist instead of only what does not.
+known_profile_names() {
+  local dir f name out=""
+  while read -r dir; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    shopt -s nullglob
+    for f in "$dir"/*.conf; do
+      name="$(basename "$f" .conf)"
+      case " $out " in *" $name "*) continue ;; esac
+      out+="$name "
+    done
+    shopt -u nullglob
+  done < <(profile_search_dirs)
+  printf '%s' "${out% }"
+}
+
+cmd_qr() {
+  local name="${EXTRA[0]:-}"
+  [[ -n "$name" ]] || die "qr needs a client name (see: $PROG list)" 2
+  # Same rule as add-client: the name is used to build a path, so ".." must not be expressible.
+  [[ "$name" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] ||
+    die "client name must match [a-zA-Z0-9_-]{1,32} (got: $name)" 2
+
+  local dir conf known
+  # A profile for a peer that is no longer in the config is a trap: it imports, the device connects,
+  # and the handshake never completes because the server has no such peer. Refuse it - unless the
+  # config cannot be read (an unprivileged run cannot tell) or there is no config at all, which is the
+  # documented "reprint a kept profile after a teardown" case.
+  conf="$(server_conf_path)"
+  if [[ -r "$conf" ]] && ! peer_in_config "$name"; then
+    die "no peer named '$name' in $conf - any profile of that name on disk is stale (the peer was removed). Re-add it: sudo $PROG add-client $name, or delete the profile" 1
+  fi
+  if ! dir="$(find_profile_for "$name")"; then
+    known="$(known_profile_names)"
+    # "this peer exists but its key is not here" has a different remedy from "no such name", so they
+    # must not share a message: the first one cannot be fixed by re-importing.
+    if peer_in_config "$name"; then
+      die "peer '$name' is in $(server_conf_path) but its profile is not in any directory I know ($(searched_dirs)). A peer's private key exists only in its profile file, so it cannot be imported - give it a new one:  sudo $PROG remove-client $name && sudo $PROG add-client $name" 1
+    fi
+    die "no profile for '$name' (searched: $(searched_dirs)). ${known:+Profiles that do exist: $known. }See '$PROG list' for the peers that exist" 1
+  fi
+  if [[ -z "$(session_outdir)" ]]; then
+    log "no session state; using the profile directory $dir"
+  fi
+  conf="$dir/$name.conf"
+
+  if [[ "$QR_PNG" == 1 ]]; then
+    have qrencode || die "qrencode is not installed, so no PNG can be written" 1
+    qrencode -o "$conf.png" -s 6 <"$conf" || die "qrencode failed for $conf" 1
+    # The PNG encodes the private key, and qrencode honours the umask: set the mode before handing
+    # the file to the operator.
+    chmod 600 "$conf.png" || warn "could not restrict the permissions on $conf.png"
+    chown_to_operator "$conf.png"
+    log "wrote $conf.png (600, owner ${SUDO_USER:-root} - print it or open it on screen to scan)"
+  fi
+
+  print_qr "$conf"
+}
+
+# ---------------------------------------------------- Burp-side integration ---
+first_client_name() {
+  local name
+  name="$(conf_peers "$(server_conf_path)" | sed -n 1p | cut -f1)"
+  printf '%s' "${name:-client}"
+}
+
+# Block until a peer completes a handshake, so "tunnel up" and "the client is actually
+# talking to me" stop being the same claim.
+cmd_wait() {
+  # Validated here as well as in validate_config: `wait` does not call it, and a non-numeric value
+  # would otherwise be read as a variable name in the arithmetic below (i.e. wait 0 seconds).
+  [[ "$WAIT_TIMEOUT" =~ ^[0-9]+$ ]] || die "invalid --timeout: $WAIT_TIMEOUT" 2
+  ensure_root
+  have wg || die "wireguard-tools is not installed" 1
+  local real
+  if ! real="$(live_wg_iface "$IFACE")"; then
+    die "$IFACE is not up - start it first: sudo $PROG up" 1
+  fi
+  if ! udp_port_bound "$LISTEN_PORT"; then
+    warn "nothing is listening on UDP $LISTEN_PORT - no handshake can arrive"
+  fi
+
+  local start deadline hs pub peer_ts found_pub="" found_name="" now
+  start="$(date +%s)"
+  deadline=$((start + WAIT_TIMEOUT))
+  log "waiting up to ${WAIT_TIMEOUT}s for a handshake on $IFACE"
+  log "import the profile on the client now:  $PROG qr $(first_client_name)"
+
+  while :; do
+    hs="$(wg show "$real" latest-handshakes 2>/dev/null || true)"
+    now="$(date +%s)"
+    while read -r pub peer_ts; do
+      [[ -n "${pub:-}" ]] || continue
+      # A handshake after `wait` started, or one recent enough to prove the client is live:
+      # the usual order is scan the QR, the client connects, then the operator runs `wait`.
+      if [[ "${peer_ts:-0}" =~ ^[0-9]+$ ]] && ((peer_ts > 0)) &&
+        ((peer_ts >= start || (now - peer_ts) <= WAIT_FRESH)); then
+        found_pub="$pub"
+        found_name="$(conf_peers "$(server_conf_path)" |
+          awk -F'\t' -v k="$pub" '$3 == k { print $1 }')"
+        break
+      fi
+    done <<<"$hs"
+    if [[ -n "$found_pub" ]]; then break; fi
+    if ((now >= deadline)); then break; fi
+    sleep 1
+  done
+
+  if [[ -n "$found_pub" ]]; then
+    printf '\n%s%s%s\n' "$C_BOLD" "handshake received" "$C_RESET"
+    printf '  peer        %s\n' "${found_name:-unknown profile}"
+    printf '  handshake   %s\n' "$(humanize_age "$(printf '%s\n' "$hs" |
+      awk -v k="$found_pub" '$1 == k { print $2 }')")"
+    proxy_bind_report || true
+    printf '\nNEXT\n'
+    printf '  1. drive the app; requests should appear in the proxy history\n'
+    printf '  2. if the history stays empty: QUIC is already dropped, so suspect certificate\n'
+    printf '     pinning or a user-store-only CA - see: %s ca\n' "$PROG"
+    printf '  3. tear down when finished: sudo %s down\n' "$PROG"
+    return 0
+  fi
+
+  print_wait_timeout_help
+  return 1
+}
+
+print_wait_timeout_help() {
+  printf '\n%s%s%s\n' "$C_YEL" "no handshake after ${WAIT_TIMEOUT}s" "$C_RESET"
+  printf '  work down this list - it is ordered by how often each item is the cause\n\n'
+  printf '  1. profile imported, tunnel switched on?  re-import it: %s qr %s\n' \
+    "$PROG" "$(first_client_name)"
+  printf '  2. can the client reach %s:%s at all?\n' "${ENDPOINT:-<endpoint>}" "$LISTEN_PORT"
+  if [[ -n "$ENDPOINT" ]] && is_private_ip "$ENDPOINT"; then
+    printf '     that endpoint is a private address: it only works with the client on this LAN\n'
+  fi
+  printf '  3. guest/corporate Wi-Fi filtering UDP %s is the usual on-site showstopper. Move the\n' "$LISTEN_PORT"
+  printf '     client to a different network to separate "filtered" from "misconfigured".\n'
+  printf '  4. an MTU that is too high hangs TLS with no error: retry with --mtu 1280.\n'
+  printf '  5. on an Android/iOS client, Private DNS (DoT) must be Off for the port-53\n'
+  printf '     redirect to apply.\n\n'
+  printf '  server side, for comparison:\n'
+  printf '    sudo wg show %s                 # peers and handshakes\n' "$IFACE"
+  printf '    sudo ss -lunp | grep %s        # is the UDP listener actually up?\n' "$LISTEN_PORT"
+  printf '    sudo %s doctor                  # re-run the preflight\n' "$PROG"
+}
+
+cmd_ca() {
+  printf '%s%s%s\n' "$C_BOLD" "trusting the interception CA on the client" "$C_RESET"
+  printf '\nEXPORT\n'
+  printf '  Burp: Proxy > Proxy settings > Import/Export CA certificate > Export >\n'
+  printf '  Certificate in DER format  ->  cacert.der\n'
+  printf '  Once the tunnel is up the easiest path is to browse to http://burp on the client.\n'
+  printf '\nINSTALL\n'
+  printf '  Android: Settings > Security > Encryption & credentials > Install a certificate\n'
+  printf '           > CA certificate > pick the file.\n'
+  printf '  iOS:     install the profile, then Settings > General > About >\n'
+  printf '           Certificate Trust Settings > enable full trust for it.\n'
+  printf '\nTHE PART THAT FOOLS PEOPLE\n'
+  printf '  Android 7+: an app that ships a networkSecurityConfig ignores the USER certificate\n'
+  printf '  store. If the CA is installed, the tunnel is up, and the app still shows nothing in\n'
+  printf '  the history, that is why - the tunnel is fine. Options:\n'
+  printf '    * install the CA into the SYSTEM store (needs root: Magisk plus a\n'
+  printf '      trust-user-certs module), or\n'
+  printf '    * unpin or disable pinning at runtime (Frida, objection), or\n'
+  printf '    * establish first whether the app pins at all: open http://burp in the client\n'
+  printf '      browser. If that page loads and the app shows nothing, the CA works and the\n'
+  printf '      app is pinning.\n'
+  printf '\nREADING THE PROXY LOG - the alert comes from the CLIENT, not the proxy\n'
+  printf '  "The client failed to negotiate a TLS connection: (certificate_unknown)" or\n'
+  printf '  "(bad_certificate)" means the CLIENT refused the proxy certificate. The proxy is\n'
+  printf '  reporting the alert it received. Two causes, different fixes:\n'
+  printf '    * the client does not trust this CA  - Android 7+ ignores user-store CAs for any app\n'
+  printf '      with a networkSecurityConfig; iOS needs the separate Certificate Trust Settings\n'
+  printf '      toggle; a work profile needs the CA inside that profile. Test it with the client\n'
+  printf '      browser: browser fine + app refused = trust store, so install into the SYSTEM store.\n'
+  printf '    * the app PINS its certificate or public key - the app compares what it sees against a\n'
+  printf '      value baked into the binary. No proxy or tunnel setting changes that: unpin at runtime\n'
+  printf '      (Frida/objection), patch the pin, or report the app as not interceptable with this\n'
+  printf '      alert as the evidence. Look at the host: errors across many unrelated domains point at\n'
+  printf '      the trust store, errors on one app backend with everything else clean point at pinning.\n'
+  printf '  Related alerts: handshake_failure/protocol_version = TLS version or cipher mismatch (not\n'
+  printf '  trust); a connection that closes with no alert = the listener is missing "Support\n'
+  printf '  invisible proxying".\n'
+  printf '\nVERIFY BEFORE TRUSTING ANY FINDING\n'
+  printf '  With the tunnel up, load http://burp (http://mitm.it for mitmproxy) on the client.\n'
+  printf '  Until that page loads, an empty proxy history means nothing at all.\n'
+  printf '  Close and reopen the app after installing a certificate: Android caches trust.\n'
+}
+
+# ------------------------------------------------------------ plan printing ---
+print_plan() {
+  printf '%s%s%s\n' "$C_BOLD" "$PROG $WGB_VERSION - dry run, nothing will be changed" "$C_RESET"
+  printf '\nRESOLVED\n'
+  printf '  interface      %s\n' "$IFACE"
+  printf '  subnet         %s  (server %s, clients %s2+)\n' "$SUBNET" "$(server_ip)" "$(subnet_base "$SUBNET")"
+  printf '  WAN interface  %s%s\n' "$WAN_IFACE" "$([[ "$WAN_DETECTED" == 1 ]] && printf '  (auto-detected; override with --wan)')"
+  if [[ "$ENDPOINT_IS_LOCAL" == 1 ]]; then
+    printf '  endpoint       %s:%s  (main local address: this host is behind NAT)\n' \
+      "$ENDPOINT" "$LISTEN_PORT"
+    if [[ -n "$PUBLIC_CANDIDATE" ]]; then
+      printf '                 a client on this network connects to it. Not reachable from cellular\n'
+      printf '                 until UDP %s is forwarded to %s upstream;\n' "$LISTEN_PORT" "$ENDPOINT"
+      printf '                 then use:  --endpoint %s\n' "$PUBLIC_CANDIDATE"
+    fi
+  else
+    printf '  endpoint       %s:%s%s\n' "$ENDPOINT" "$LISTEN_PORT" \
+      "$([[ "$ENDPOINT_DETECTED" == 1 ]] && printf '  (auto-detected; override with --endpoint)')"
+    if [[ -n "$ENDPOINT" ]] && endpoint_behind_nat "$ENDPOINT"; then
+      printf '  reachability   WARN %s is not an address this host holds: this machine is behind\n' "$ENDPOINT"
+      printf '                 NAT, so the client connects only if UDP %s is forwarded to %s upstream.\n' \
+        "$LISTEN_PORT" "$(nat_target_hint)"
+    fi
+  fi
+  printf '  DNS            %s (port-53 redirect kept as a safety net)\n' "$DNS"
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    printf '  interception   all TCP from the tunnel -> port %s\n' "$BURP_PORT"
+  else
+    printf '  interception   disabled (--no-proxy: plain tunnel)\n'
+  fi
+  printf '  QUIC           %s\n' "$([[ "$BLOCK_QUIC" == 1 ]] && printf 'UDP 443 dropped from the tunnel (apps fall back to TCP)' || printf 'allowed (UDP 443 will bypass the proxy)')"
+  if [[ "$FIX_FIREWALL" == 1 ]] && [[ -n "$(forward_drop_chains)" ]]; then
+    if ufw_is_active && ufw_owns_drop "$(forward_drop_chains)"; then
+      printf '  firewall       another chain drops forwarded traffic; would add, then remove on down:\n'
+      printf '                   sudo ufw route allow from %s\n' "$SUBNET"
+    else
+      printf '  firewall       another chain drops forwarded traffic; this tool would only report it\n'
+      printf '                 (not ufw'"'"'s to fix - see `%s doctor` for the owner)\n' "$PROG"
+    fi
+  fi
+  printf '  MTU            %s\n' "$MTU"
+  printf '  clients        %s (%s new, %s reused from the existing config)\n' \
+    "${#CLIENT_NAMES[@]}" "$((${#CLIENT_NAMES[@]} - $(reused_client_count)))" "$(reused_client_count)"
+
+  printf '\nFILES THAT WOULD BE WRITTEN\n'
+  printf '  %s   (0600 root)\n' "$(server_conf_path)"
+  printf '  %s/%s.nft%s\n' "$STATE_DIR" "$IFACE" "   (ruleset passed to nft -f)"
+  printf '  %s   (state, so `%s down` can undo exactly this)\n' "$(state_file)" "$PROG"
+  local i
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 1 ]]; then
+      printf '  %s/<timestamp>/%s.conf   (0600, owner %s)\n' \
+        "$OUT_BASE" "${CLIENT_NAMES[$i]}" "${SUDO_USER:-$(id -un)}"
+    else
+      printf '  (no file)                 %s is reused: its profile is not rewritten\n' \
+        "${CLIENT_NAMES[$i]}"
+    fi
+  done
+
+  printf '\nSERVER CONFIG (%s)\n\n' "$(server_conf_path)"
+  render_server_conf
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" != 1 ]]; then
+      printf '\nCLIENT CONFIG (%s)\n\n  reused - the private key exists only in the profile already on disk\n' \
+        "${CLIENT_NAMES[$i]}"
+      continue
+    fi
+    printf '\nCLIENT CONFIG (%s/<timestamp>/%s.conf)\n\n' "$OUT_BASE" "${CLIENT_NAMES[$i]}"
+    render_client_conf "${CLIENT_ADDRS[$i]}" "${CLIENT_PRIVKEYS[$i]}"
+  done
+
+  printf '\nFIREWALL (nft -f -, one atomic transaction, table inet %s)\n\n' "$NFT_TABLE"
+  render_nft
+
+  printf '\nCOMMANDS THAT WOULD RUN\n'
+  printf '  1. nft delete table inet %s   # only if it already exists: reconcile, never stack\n' "$NFT_TABLE"
+  printf '  2. nft -f %s/%s.nft\n' "$STATE_DIR" "$IFACE"
+  printf '  3. install -m 0600 %s\n' "$(server_conf_path)"
+  printf '  4. wg-quick up %s\n' "$IFACE"
+  printf '  5. sysctl -w net.ipv4.ip_forward=1   (prior value %s, restored by `%s down`)\n' \
+    "$(current_ip_forward)" "$PROG"
+
+  print_client_checklist
+}
+
+print_client_checklist() {
+  printf '\nBEFORE YOU TEST - the traps that silently waste an hour\n'
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    printf '  * Burp must listen on 0.0.0.0 (or %s), never 127.0.0.1:\n' "$(server_ip)"
+    printf '    redirect rewrites the destination to this box, so a loopback-only\n'
+    printf '    listener receives nothing.  Check: ss -ltnp '"'"'sport = :%s'"'"'\n' "$BURP_PORT"
+    printf '  * Burp listener needs "Support invisible proxying" enabled.\n'
+  fi
+  printf '  * Android/iOS client: set Private DNS to Off (DoT on 853 bypasses the port-53\n'
+  printf '    redirect, or gets redirected into the proxy and stalls).\n'
+  printf '  * Android/iOS client: install the Burp CA - user-store CAs are ignored by most\n'
+  printf '    modern apps.\n'
+  printf '  * Android/iOS client: keep MTU %s (a wrong MTU hangs TLS with no error).\n' "$MTU"
+  printf '  * Android/iOS client: enable Always-on VPN + "Block connections without VPN" so\n'
+  printf '    apps do not leak when the tunnel drops.\n'
+}
+
+# ------------------------------------------------------------- preflight ----
+# Base chains hooked at `forward` other than our own. An nft `accept` is NOT terminal across base
+# chains, so a DROP policy in any of these drops tunnel traffic no matter what this tool installs.
+# Naming them is worth more than a vague "interaction is possible".
+#
+# Returns 0 even when there is nothing to report: this is called as `others="$(...)"`, and under
+# `set -e` a non-zero return there aborts the caller silently. `grep -v` exits 1 when it filters
+# everything out, which is exactly the "no competing chains" case.
+other_forward_chains() {
+  have nft || return 0
+  local out
+  out="$(nft list ruleset 2>/dev/null | awk '
+    /^table / { table = $2 " " $3 }
+    /hook forward/ { print table }
+  ' | sort -u | grep -v "^inet ${NFT_TABLE}$" || true)"
+  printf '%s' "$out"
+  return 0
+}
+
+# Forward-hook chains in OTHER tables whose policy is drop. A drop there discards the packet no
+# matter what this tool accepts, and it is the difference between "the tunnel works" and "the client
+# has no internet while every check here passes". Returns 0 even when nothing is found: it is called
+# in command substitutions under `set -e`.
+forward_drop_chains() {
+  have nft || return 0
+  local out
+  out="$(nft list ruleset 2>/dev/null | awk '
+    /^table / { table = $2 " " $3 }
+    /hook forward/ && /policy drop/ { print table }
+  ' | sort -u | grep -v "^inet ${NFT_TABLE}$" || true)"
+  printf '%s' "$out"
+  return 0
+}
+
+# ------------------------------------------------- firewall coordination ---
+# A DROP policy in another table's forward chain cannot be overridden from this tool, so when ufw owns
+# it the tool asks ufw (its own command, so the rule stays valid across `ufw reload`) and RECORDS what
+# it added - `down` removes exactly that, and only if this session added it.
+#
+# Is a ROUTED (FWD) allow already in ufw for this subnet? Only that answers the question: a plain
+# `ufw allow from <subnet>` is an INCOMING rule, governs nothing that is forwarded, and matching it
+# here would report the drop as already fixed - the very misconception this feature exists to correct.
+# (ufw renders a route rule as "ALLOW FWD" + the source address, and an incoming one as "ALLOW".)
+ufw_route_listed() { # <subnet>
+  have ufw || return 1
+  ufw status 2>/dev/null | grep -F 'ALLOW FWD' | grep -qF "$1"
+}
+
+# Is ufw actually running? The whole-line match is the point: `ufw status` prints "Status: inactive",
+# which contains the word "active" - a substring test reads a switched-off firewall as an active one
+# and then adds rules to a firewall that is not dropping anything.
+ufw_is_active() {
+  have ufw || return 1
+  ufw status 2>/dev/null | head -1 | grep -qE '^Status:[[:space:]]+active[[:space:]]*$'
+}
+
+# Name the product most likely to own a dropping chain, when its chain names give it away. An
+# advisory that says which firewall to fix is worth far more than one that says "another firewall".
+# Prints ready-to-warn lines, one per finding (possibly none).
+forward_drop_owner_hint() { # <table list, one "family name" per line>
+  local table family name body out=""
+  while IFS= read -r table; do
+    if [[ -z "$table" ]]; then continue; fi
+    family="${table%% *}"
+    name="${table#* }"
+    body="$(nft list table "$family" "$name" 2>/dev/null || true)"
+    case "$body" in
+      *DOCKER-USER*|*DOCKER-FORWARD*)
+        out+="$table holds docker's chains, and docker documents DOCKER-USER as the hook for traffic
+    it should still forward:  sudo iptables -I DOCKER-USER -s $SUBNET -j ACCEPT
+" ;;
+      *LIBVIRT_FW*)
+        out+="$table holds libvirt's chains: allow $SUBNET in its forward rules, or stop the libvirt
+    network while you test
+" ;;
+      *ts-forward*)
+        out+="$table holds Tailscale's forward chain (ts-forward): allow $SUBNET there
+" ;;
+      *ufw-*)
+        out+="$table still holds ufw's chains although ufw reports inactive: if ufw is meant to be on,
+    enable it (sudo ufw enable) and this tool handles it there instead
+" ;;
+      *) out+="$table
+" ;;
+    esac
+  done <<<"$1"
+  printf '%s' "$out"
+}
+
+# Does one of the dropping tables actually carry ufw's own chains? Only then is a ufw route rule the
+# right fix: a DROP policy in some *other* product's table is not something ufw can lift, and adding
+# the rule anyway would report a fix that did not happen.
+ufw_owns_drop() { # <table list, one "family name" per line>
+  local table family name body
+  while IFS= read -r table; do
+    if [[ -z "$table" ]]; then continue; fi
+    family="${table%% *}"
+    name="${table#* }"
+    body="$(nft list table "$family" "$name" 2>/dev/null || true)"
+    case "$body" in
+      *ufw-*) return 0 ;;
+    esac
+  done <<<"$1"
+  return 1
+}
+
+# Apply the allowance the tunnel needs, or explain why it cannot. Called by `up`; the result is
+# recorded in the state as FIREWALL_FIX so teardown can undo precisely this.
+fix_forward_drop() {
+  local drops_list drops hint line ufw_state
+  drops_list="$(forward_drop_chains)"
+  [[ -n "$drops_list" ]] || return 0
+  drops="$(printf '%s' "$drops_list" | tr '\n' ' ')"
+
+  if ufw_is_active; then
+    ufw_state=active
+  elif have ufw; then
+    ufw_state=inactive
+  else
+    ufw_state=absent
+  fi
+
+  if [[ "$FIX_FIREWALL" != 1 ]]; then
+    report_forward_drops warn
+    return 0
+  fi
+  if [[ "$ufw_state" == active ]] && ufw_owns_drop "$drops_list"; then
+    if ufw_route_listed "$SUBNET"; then
+      # Recorded by this session (or durably by an earlier one, which outlives a reboot) means it is
+      # OUR rule and teardown must still remove it. Recorded by nobody means somebody else allowed it:
+      # do not add a duplicate, and never remove theirs.
+      if [[ "$FIREWALL_FIX" == "ufw-route:$SUBNET" ]] ||
+        recorded_undos_of ufw-route | grep -qxF "$SUBNET"; then
+        FIREWALL_FIX="ufw-route:$SUBNET"
+        record_undo "$FIREWALL_FIX"
+        log "the ufw route rule for $SUBNET is already in place from a session this tool ran; this one adopts it and removes it on '$PROG down'"
+      else
+        log "forwarded traffic from $SUBNET is already allowed in ufw - leaving it as it is"
+      fi
+      return 0
+    fi
+    if ufw route allow from "$SUBNET" >/dev/null 2>&1; then
+      FIREWALL_FIX="ufw-route:$SUBNET"
+      record_undo "$FIREWALL_FIX"
+      log "allowed forwarded traffic from $SUBNET in ufw (policy DROP in $drops; '$PROG down' removes this again)"
+      return 0
+    fi
+    warn "another firewall drops forwarded packets: $drops"
+    warn "  and the ufw route rule could not be added, so the client still has no internet. Add it:"
+    warn "  sudo ufw route allow from $SUBNET"
+    return 0
+  fi
+  # Nothing here is ufw's to fix: ufw is absent, or switched off, or active but not the owner of any
+  # dropping chain (its rule could not lift another product's DROP policy). Never guess at another
+  # product's rule syntax or chain layout: name the chain, name its likely owner, and give the command
+  # sanctioned for that owner.
+  case "$ufw_state" in
+    inactive)
+      warn "ufw is installed but not active, so it is not what drops these packets."
+      ;;
+    active)
+      warn "ufw is active, but a DROP policy in another product's table is not ufw's to lift,"
+      warn "  so a ufw route rule would not help here."
+      ;;
+  esac
+  warn "another firewall drops forwarded packets:"
+  hint="$(forward_drop_owner_hint "$drops_list")"
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then warn "  $line"; fi
+  done <<<"$hint"
+  warn "  allow $SUBNET there, or run '$PROG up --no-fix-firewall' to silence this."
+  return 0
+}
+
+# Undo exactly what `up` added - never a rule this session did not create. The command is ufw's
+# documented route form (`ufw route delete ...`): ufw re-inserts `rule` after a leading rule command,
+# so `ufw delete route allow from X` is parsed as `rule delete route allow from X` and rejected as
+# "Invalid syntax" - a remediation line that does not work is worse than none.
+undo_forward_drop_fix() { # <recorded FIREWALL_FIX>
+  local fix="$1" subnet
+  case "$fix" in
+    ufw-route:*)
+      subnet="${fix#ufw-route:}"
+      have ufw || return 0
+      if ufw route delete allow from "$subnet" >/dev/null 2>&1; then
+        forget_undo "ufw-route:$subnet"
+        log "removed the ufw route rule this session added for $subnet"
+      else
+        warn "could not remove the ufw route rule for $subnet - remove it yourself:"
+        warn "  sudo ufw route delete allow from $subnet"
+      fi
+      ;;
+    *) warn "not undoing an unrecognised firewall fix recorded in state: $fix" ;;
+  esac
+  return 0
+}
+# Report - in one place, used by doctor and by `up` when the fix is declined - the condition that
+# silently kills the client's traffic: someone else's forward chain drops it. The remedy is named
+# because an operator staring at "handshake OK, nothing loads" will not guess whose policy it is.
+report_forward_drops() { # <printer: printf|warn>
+  local how="$1" drops target
+  drops="$(forward_drop_chains)"
+  [[ -n "$drops" ]] || return 0
+  drops="$(printf '%s' "$drops" | tr '\n' ' ')"
+  if ufw_is_active; then
+    target="sudo ufw route allow from $SUBNET"
+  else
+    target="allow $SUBNET in that firewall's forward rules"
+  fi
+  if [[ "$how" == warn ]]; then
+    warn "another firewall drops forwarded packets: $drops"
+    warn "  a DROP policy there beats what this tool installs, so anything NOT sent to the proxy"
+    warn "  (DNS included) never reaches the internet. Fix:  $target"
+  else
+    printf '  WARN a forward-hook chain in another table has policy DROP: %s\n' "$drops"
+    printf '       a drop there beats what this tool installs, so anything NOT sent to the proxy\n'
+    printf '       (DNS included) is discarded while the tunnel itself looks healthy.\n'
+    printf '         fix:  %s\n' "$target"
+  fi
+  return 0
+}
+
+cmd_doctor() {
+  local rc=0 addr addrs module_state others ufw_default pending_left
+
+  printf '%s%s%s\n' "$C_BOLD" "$PROG $WGB_VERSION - preflight (read-only, changes nothing)" "$C_RESET"
+  printf '\nCAPABILITIES\n'
+
+  if [[ "$HOST_OS" == Darwin ]]; then
+    if have wg && have wg-quick && have wireguard-go; then
+      printf '  OK   WireGuard CLI tools available\n'
+    else
+      printf '  FAIL WireGuard CLI tools missing (brew install wireguard-tools)\n'
+      rc=1
+    fi
+    if (( BASH_VERSINFO[0] < 4 )); then
+      printf '  FAIL Bash 4+ required; check the interpreter selected under sudo\n'
+      rc=1
+    fi
+    if (( EUID != 0 )); then
+      printf '  ..   Run sudo wgb doctor to inspect active PF hooks (read-only)\n'
+    elif pf_hooks_ready; then
+      printf '  OK   Dedicated wgb/* PF hooks are active\n'
+    else
+      printf '  FAIL Missing active wgb/* PF hooks; see docs/macos.md\n'
+      rc=1
+    fi
+    printf '  WAN: %s; local IPv4: %s\n' "$(detect_wan_iface)" "$(route_src_ipv4 2>/dev/null || true)"
+    proxy_bind_report || true
+    return "$rc"
+  fi
+
+  if [[ "$(id -u)" == 0 ]]; then
+    printf '  OK   running as root (up/down possible in this shell)\n'
+  else
+    printf '  WARN not running as root - `up`/`down` will need sudo; doctor does not\n'
+  fi
+  if have nft; then
+    printf '  OK   nft present: %s\n' "$(nft --version 2>/dev/null | head -1)"
+  else
+    printf '  FAIL nft missing - install nftables (required: interception rules)\n'
+    rc=1
+  fi
+  if [[ -d /sys/module/wireguard ]]; then
+    module_state="loaded"
+  elif have modinfo && modinfo wireguard >/dev/null 2>&1; then
+    module_state="available (not loaded yet)"
+  else
+    module_state=""
+  fi
+  if [[ -n "$module_state" ]]; then
+    printf '  OK   wireguard kernel module: %s\n' "$module_state"
+  else
+    printf '  FAIL wireguard kernel module not found\n'
+    rc=1
+  fi
+  if have wg && have wg-quick; then
+    printf '  OK   wireguard-tools present\n'
+  else
+    printf '  FAIL wireguard-tools missing - install it (needed for key generation and up)\n'
+    rc=1
+  fi
+  if have qrencode; then
+    printf '  OK   qrencode present (camera import)\n'
+  else
+    printf '  WARN qrencode missing - QR import unavailable; profiles can still be\n'
+    printf '       pushed as files: adb push <name>.conf /sdcard/Download/\n'
+  fi
+
+  printf '\nROUTING\n'
+  # Deliberately not resolve_wan: doctor reports a failure instead of aborting.
+  if [[ -z "$WAN_IFACE" ]]; then
+    WAN_IFACE="$(detect_wan_iface)"
+    WAN_DETECTED=1
+  fi
+  if [[ -n "$WAN_IFACE" ]]; then
+    printf '  OK   WAN interface: %s (used for masquerade)\n' "$WAN_IFACE"
+  else
+    printf '  FAIL could not detect a WAN interface - pass --wan NAME\n'
+    rc=1
+  fi
+  if [[ -z "$ENDPOINT" ]]; then
+    # Same policy as `up`, but it must not abort: doctor reports.
+    if ! choose_default_endpoint; then ENDPOINT=""; fi
+  fi
+  if [[ -n "$ENDPOINT" ]]; then
+    printf '  ..   endpoint resolves to %s:%s\n' "$ENDPOINT" "$LISTEN_PORT"
+    if [[ "$ENDPOINT_IS_LOCAL" == 1 ]]; then
+      printf '  ..   that is the main local address: this host is behind NAT, so it is the address\n'
+      printf '       a client on this network would use. For cellular, UDP %s must be forwarded to\n' "$LISTEN_PORT"
+      printf '       it%s.\n' "$([[ -n "$PUBLIC_CANDIDATE" ]] && printf ' (public address: %s)' "$PUBLIC_CANDIDATE")"
+    elif is_private_ip "$ENDPOINT"; then
+      printf '  WARN that is a private address - a client on cellular cannot reach it\n'
+    elif endpoint_behind_nat "$ENDPOINT"; then
+      # The single most common on-site dead end: the advertised address belongs to a NAT that has
+      # to forward the port to us, and nothing in the tunnel is wrong when it does not.
+      printf '  WARN %s is not an address this host holds - this machine is behind NAT, so the\n' "$ENDPOINT"
+      printf '       client reaches whatever NATs for it. The handshake arrives only if that device\n'
+      printf '       forwards UDP %s to %s. Behind CGNAT there is no forward to add:\n' "$LISTEN_PORT" "$(nat_target_hint)"
+      printf '       put the client on this LAN and pass --endpoint %s instead.\n' "$(nat_target_hint)"
+    fi
+  else
+    printf '  WARN no endpoint address could be determined - pass --endpoint HOST\n'
+  fi
+  printf '  ..   ip_forward is currently %s (expected 1 while the tunnel is up)\n' "$(current_ip_forward)"
+  # The client profile routes ::/0 in, but this tunnel cannot carry IPv6. Said here because the
+  # symptom on a dual-stack network is "many SSL errors" on the client, which looks like a CA problem.
+  if [[ -n "$(local_ipv6_global || true)" ]]; then
+    printf '  WARN ipv6: this host has a global IPv6 address but the tunnel does not carry IPv6:\n'
+    printf '       the ruleset rejects IPv6 inside the tunnel, so apps fall back to IPv4 rather\n'
+    printf '       than waiting on a black hole. Carrying IPv6 would need an IPv6 subnet in the\n'
+    printf '       tunnel plus forwarding and masquerade - not implemented.\n'
+  else
+    printf '  ..   ipv6: not carried (and this host has no global IPv6 address to route it with).\n'
+    printf '       The ruleset rejects IPv6 inside the tunnel so apps fall back to IPv4 instead of\n'
+    printf '       hanging on a black hole - on dual-stack networks that black hole shows up as\n'
+    printf '       SSL/connection failures on the client, which is easy to mistake for a CA problem.\n'
+  fi
+
+  printf '\nLISTENERS\n'
+  if udp_port_bound "$LISTEN_PORT"; then
+    printf '  WARN UDP %s is already bound - another tunnel may be running\n' "$LISTEN_PORT"
+  else
+    printf '  OK   UDP %s free for WireGuard\n' "$LISTEN_PORT"
+  fi
+  if [[ "$PROXY_MODE" == 1 ]]; then
+    addrs="$(burp_bind_addrs || true)"
+    if [[ -z "$addrs" ]]; then
+      printf '  WARN nothing listening on TCP %s yet - start the proxy before testing\n' "$BURP_PORT"
+    else
+      while read -r addr; do
+        [[ -z "$addr" ]] && continue
+        case "$addr" in
+          127.0.0.1|::1)
+            printf '  FAIL proxy is bound to %s:%s - redirected traffic is blackholed.\n' "$addr" "$BURP_PORT"
+            printf '       Bind the listener to 0.0.0.0 (or %s) instead.\n' "$(server_ip)"
+            rc=1
+            ;;
+          *)
+            printf '  OK   proxy listening on %s:%s\n' "$addr" "$BURP_PORT"
+            ;;
+        esac
+      done <<<"$addrs"
+    fi
+  fi
+
+  printf '\nEXISTING STATE\n'
+  if have ip; then
+    if ip link show dev "$IFACE" >/dev/null 2>&1; then
+      printf '  WARN %s already exists - `%s up` will reconcile, `%s down` cleans it\n' "$IFACE" "$PROG" "$PROG"
+    else
+      printf '  OK   %s does not exist yet\n' "$IFACE"
+    fi
+  fi
+  if [[ -e "$(state_file)" ]]; then
+    printf '  WARN state file exists (%s) - a session is already tracked\n' "$(state_file)"
+  else
+    printf '  OK   no session state under %s\n' "$STATE_DIR"
+  fi
+  if [[ -e "$(server_conf_path)" ]]; then
+    printf '  WARN %s exists and would be backed up before writing\n' "$(server_conf_path)"
+  fi
+  # Changes this tool made in an EARLIER session, recorded outside the session state so a reboot
+  # cannot hide them. Unreported, they are a firewall rule or a key-bearing backup nobody remembers.
+  pending_left="$(recorded_undos)"
+  if [[ -n "$pending_left" ]]; then
+    printf '  WARN an earlier session recorded changes this tool made, still not reverted:\n'
+    while IFS= read -r line; do
+      if [[ -n "$line" ]]; then printf '         %s\n' "$line"; fi
+    done <<<"$pending_left"
+    printf '       revert them with:  sudo %s down --purge\n' "$PROG"
+  fi
+  if [[ -f /etc/nftables.conf ]]; then
+    printf '  ..   /etc/nftables.conf exists - this tool only touches table inet %s\n' "$NFT_TABLE"
+  fi
+
+  printf '\nCOEXISTING FIREWALLS\n'
+  if [[ "$(id -u)" != 0 ]]; then
+    printf '  ..   needs root to read the live ruleset and the firewall state\n'
+  elif ! have nft; then
+    printf '  FAIL nft missing, so the ruleset cannot be inspected\n'
+  else
+    others="$(other_forward_chains)"
+    if [[ -z "$others" ]]; then
+      printf '  OK   this tool owns the only forward chain in the ruleset\n'
+    else
+      printf '  WARN other tables also hook forward: %s\n' "$(printf '%s' "$others" | tr '\n' ' ')"
+      printf '       an nft accept is NOT terminal across base chains, so a DROP policy there\n'
+      printf '       drops tunnel traffic regardless of what this tool installs. Allow %s\n' "$SUBNET"
+      printf '       in those rules too.\n'
+    fi
+    report_forward_drops printf
+  fi
+  if have ufw && [[ "$(id -u)" == 0 ]]; then
+    # `ufw_is_active`, not a substring case: "Status: inactive" contains "active".
+    if ufw_is_active; then
+      # Incoming rules do NOT govern forwarded traffic, so "I allow all incoming" is not an answer
+      # to this question. ufw's own routed policy is quoted instead of paraphrased.
+      ufw_default="$(ufw status verbose 2>/dev/null | awk '/^Default:/ { print; exit }')"
+      printf '  WARN ufw is active. Its incoming rules do NOT apply to forwarded traffic, so "allow\n'
+      printf '       all incoming" does not cover the tunnel. ufw says:\n'
+      printf '         %s\n' "${ufw_default:-Default: (unreadable - run: sudo ufw status verbose)}"
+      printf '       If that reads "disabled (routed)" (or /etc/default/ufw has\n'
+      printf '       DEFAULT_FORWARD_POLICY="DROP"), the tunnel subnet is discarded after this tool\n'
+      printf '       accepts it: handshake fine, client has no internet, proxy never sees a thing.\n'
+      printf '       `%s up` fixes this itself and `%s down` removes it again; by hand:\n' "$PROG" "$PROG"
+      printf '         sudo ufw route allow from %s\n' "$SUBNET"
+    else
+      printf '  OK   ufw is installed but not active (its rules are not in play)\n'
+    fi
+  elif have ufw; then
+    printf '  ..   ufw is installed - needs root to read its state\n'
+  fi
+  if have firewall-cmd && [[ "$(id -u)" == 0 ]]; then
+    case "$(firewall-cmd --state 2>/dev/null || true)" in
+      running)
+        printf '  WARN firewalld is running: its forward policy applies to the tunnel too.\n'
+        printf '       Allow %s there as well.\n' "$SUBNET"
+        ;;
+      *) printf '  OK   firewalld is installed but not running\n' ;;
+    esac
+  elif have firewall-cmd; then
+    printf '  ..   firewalld is installed - needs root to read its state\n'
+  fi
+  if ! have ufw && ! have firewall-cmd; then
+    printf '  OK   neither ufw nor firewalld is installed\n'
+  fi
+
+  printf '\nTRANSPORT REALITY CHECK\n'
+  printf '  ..   If the client cannot reach %s:%s on cellular or corporate Wi-Fi, the\n' "$ENDPOINT" "$LISTEN_PORT"
+  printf '       usual cause is filtered UDP %s - a transport problem, not a config\n' "$LISTEN_PORT"
+  printf '       error. It needs an obfuscated fallback (wstunnel/udp2raw), which this\n'
+  printf '       tool does not do yet.\n'
+
+  printf '\n'
+  if [[ "$rc" == 0 ]]; then
+    printf '%sdoctor: no blocking problems found%s\n' "$C_GRN" "$C_RESET"
+  else
+    printf '%sdoctor: blocking problems found (see FAIL lines)%s\n' "$C_RED" "$C_RESET"
+  fi
+  return "$rc"
+}
+
+# ------------------------------------------------------------ validation ----
+validate_config() {
+  [[ "$SUBNET" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24$ ]] ||
+    die "subnet must be a full x.y.z.0/24 network (got: $SUBNET)" 2
+  is_ipv4 "$(server_ip)" || die "subnet base is not a valid address (got: $SUBNET)" 2
+  if ! [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || ((LISTEN_PORT < 1 || LISTEN_PORT > 65535)); then
+    die "invalid --listen-port: $LISTEN_PORT" 2
+  fi
+  if ! [[ "$BURP_PORT" =~ ^[0-9]+$ ]] || ((BURP_PORT < 1 || BURP_PORT > 65535)); then
+    die "invalid --burp-port: $BURP_PORT" 2
+  fi
+  if ! [[ "$MTU" =~ ^[0-9]+$ ]] || ((MTU < 576 || MTU > 1500)); then
+    die "invalid --mtu: $MTU (expected 576-1500)" 2
+  fi
+  is_ipv4 "$DNS" || die "client --dns must be an IPv4 address (got: $DNS)" 2
+  if ! [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || ((CLIENT_COUNT < 1 || CLIENT_COUNT > 250)); then
+    die "invalid --clients: $CLIENT_COUNT (expected 1-250)" 2
+  fi
+  is_iface_name "$IFACE" || die "invalid --iface: $IFACE" 2
+  # An absolute config directory is not pedantry: a relative one makes `wgb down`, `list` or
+  # `add-client` operate on a different file depending on the working directory. --config-dir
+  # refuses one at parse time; this catches the same value arriving through the environment.
+  [[ "$WG_ETC_DIR" == /* ]] ||
+    die "the config directory must be an absolute path (got: $WG_ETC_DIR); a relative one breaks 'wgb down' from another directory" 2
+  # Anything written into the ruleset or into a profile is checked before it gets there: --wan is
+  # interpolated into nft syntax and --endpoint into the profile the client imports.
+  [[ -z "$WAN_IFACE" ]] || is_iface_name "$WAN_IFACE" ||
+    die "invalid --wan: $WAN_IFACE (expected an interface name such as eth0)" 2
+  [[ -z "$ENDPOINT" ]] || is_host "$ENDPOINT" ||
+    die "invalid --endpoint: $ENDPOINT (expected an IPv4 address or a hostname)" 2
+  [[ "$WAIT_TIMEOUT" =~ ^[0-9]+$ ]] || die "invalid --timeout: $WAIT_TIMEOUT" 2
+}
+
+resolve_wan() {
+  [[ -n "$WAN_IFACE" ]] && return 0
+  WAN_IFACE="$(detect_wan_iface)"
+  WAN_DETECTED=1
+  [[ -n "$WAN_IFACE" ]] || die "could not detect the WAN interface; pass --wan NAME"
+}
+
+# The session that is already running can be found without the operator repeating --iface,
+# --config-dir or the output base: the state file is keyed by interface name and records the rest.
+# Without this, `wgb up --config-dir /custom` followed by `wgb down --purge` would delete a
+# default-path config that does not exist and leave the real key material in /custom behind.
+adopt_session() {
+  local files=() f newest="" dir sf
+
+  if [[ "$IFACE_SET" == 0 ]]; then
+    shopt -s nullglob
+    files=("$STATE_DIR"/*.env)
+    shopt -u nullglob
+    if (( ${#files[@]} )); then
+      newest="${files[0]}"
+      for f in "${files[@]}"; do
+        if [[ "$f" -nt "$newest" ]]; then newest="$f"; fi
+      done
+      if (( ${#files[@]} > 1 )); then
+        warn "several sessions are tracked in $STATE_DIR - using $(basename "$newest")"
+      fi
+      IFACE="$(basename "$newest" .env)"
+    fi
+  fi
+
+  # Adopt from the state file for the EFFECTIVE interface, whether or not --iface was given:
+  # `down --iface wgm1 --purge` after `up --iface wgm1 --config-dir /custom` must still find
+  # /custom, and coupling this to the --iface branch would miss exactly that case.
+  sf="$STATE_DIR/$IFACE.env"
+  if [[ ! -r "$sf" ]]; then return 0; fi
+  if [[ "$CONF_DIR_SET" == 0 ]]; then
+    dir="$(state_get CONF_DIR "$sf" || true)"
+    # Only an absolute recorded path is adopted: a relative one would resolve against whatever
+    # directory the command happens to run from.
+    if [[ -n "$dir" && "$dir" == /* && "$dir" != "$WG_ETC_DIR" ]]; then WG_ETC_DIR="$dir"; fi
+  fi
+  if [[ "$OUT_BASE_SET" == 0 ]]; then
+    dir="$(state_get OUT_BASE "$sf" || true)"
+    if [[ -n "$dir" && "$dir" == /* && "$dir" != "$OUT_BASE" ]]; then OUT_BASE="$dir"; fi
+  fi
+  return 0
+}
+
+resolve_endpoint() {
+  [[ -n "$ENDPOINT" ]] && return 0
+  choose_default_endpoint || die "could not determine an endpoint address; pass --endpoint HOST"
+  return 0
+}
+
+# Which address the client should dial, in order of preference:
+#
+#   1. `--endpoint` (handled by the callers, always wins).
+#   2. The detected public address, but ONLY if this host actually holds it - then a client on
+#      cellular can reach it directly and it is the best answer.
+#   3. Otherwise the host's main local address: the one on the default route, i.e. the LAN/WLAN
+#      address. A public address this host does not hold belongs to a NAT that must be configured
+#      to forward the port, so defaulting to it hands over a profile that cannot connect. The LAN
+#      address at least works for a client on the same network, and the plan/doctor print the
+#      public alternative and what it would need.
+#
+# Never dies: `doctor` reports instead of aborting, so it returns non-zero when it cannot decide.
+choose_default_endpoint() {
+  local pub lan
+  pub="$(detect_public_ip || true)"
+  if [[ -n "$pub" ]] && ! endpoint_behind_nat "$pub"; then
+    ENDPOINT="$pub"
+    ENDPOINT_DETECTED=1
+    ENDPOINT_IS_LOCAL=0
+    PUBLIC_CANDIDATE=""
+    return 0
+  fi
+  PUBLIC_CANDIDATE="$pub"
+  lan="$(route_src_ipv4 || true)"
+  # The default route answers "which of my addresses is on the network I am actually using", but
+  # never advertise the tunnel's own address.
+  if [[ -z "$lan" || "$lan" == "$(subnet_base "$SUBNET")"* ]]; then
+    lan="$(local_ipv4 || true)"
+  fi
+  [[ -n "$lan" ]] || return 1
+  ENDPOINT="$lan"
+  ENDPOINT_DETECTED=0
+  ENDPOINT_IS_LOCAL=1
+  return 0
+}
+
+# Client set for this run: every peer already in the config is kept (a repeat run must never
+# drop a device that is working), then the names requested by --clients are added only if they
+# are missing. $2 is the existing "name<TAB>address<TAB>pubkey" listing, empty on a first run.
+build_clients() {
+  local n="$1" existing_list="$2" i name priv pub addr en ea ep
+  CLIENT_NAMES=()
+  CLIENT_PRIVKEYS=()
+  CLIENT_PUBKEYS=()
+  CLIENT_ADDRS=()
+  CLIENT_IS_NEW=()
+  REQUESTED_NAMES=()
+
+  while IFS=$'\t' read -r en ea ep; do
+    [[ -n "${ea:-}" ]] || continue
+    CLIENT_NAMES+=("$en")
+    CLIENT_ADDRS+=("$ea")
+    CLIENT_PUBKEYS+=("$ep")
+    CLIENT_PRIVKEYS+=("")
+    CLIENT_IS_NEW+=(0)
+  done <<<"$existing_list"
+
+  # Naming rule: --clients 1 is always "client"; --clients N>1 is client1..clientN. It is
+  # deliberately not "client, client2, ..." because that would rename the single-client case,
+  # which every example and the QR workflow depend on.
+  for ((i = 1; i <= n; i++)); do
+    if [[ "$n" == 1 ]]; then name="client"; else name="client$i"; fi
+    REQUESTED_NAMES+=("$name")
+    if name_index "$name" >/dev/null; then
+      continue
+    fi
+    priv="$(gen_privkey)"
+    pub="$(gen_pubkey "$priv")"
+    addr="$(alloc_next_ip "${CLIENT_ADDRS[@]:-}")" ||
+      die "no free address left in $SUBNET"
+    CLIENT_NAMES+=("$name")
+    CLIENT_PRIVKEYS+=("$priv")
+    CLIENT_PUBKEYS+=("$pub")
+    CLIENT_ADDRS+=("$addr")
+    CLIENT_IS_NEW+=(1)
+  done
+  return 0
+}
+
+reused_client_count() {
+  local i n=0
+  for i in "${!CLIENT_IS_NEW[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 0 ]]; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+
+is_requested_name() {
+  local want="$1" n
+  for n in "${REQUESTED_NAMES[@]:-}"; do
+    if [[ -n "$n" && "$n" == "$want" ]]; then return 0; fi
+  done
+  return 1
+}
+
+# Peers kept from an earlier session because this run did not ask for them.
+unrequested_peer_names() {
+  local i out=""
+  for i in "${!CLIENT_NAMES[@]}"; do
+    if [[ "${CLIENT_IS_NEW[$i]}" == 0 ]] && ! is_requested_name "${CLIENT_NAMES[$i]}"; then
+      out+="${CLIENT_NAMES[$i]} "
+    fi
+  done
+  printf '%s' "${out% }"
+}
+
+# Peers kept from the config whose profile is nowhere the tool can see. Their private key exists only
+# in that file, so the device cannot be (re-)imported and `qr` can never print one: saying it at
+# bring-up is the difference between "the QR fails later" and a five-second fix now.
+missing_profile_names() {
+  local i out=""
+  for i in "${!CLIENT_NAMES[@]}"; do
+    [[ "${CLIENT_IS_NEW[$i]}" == 0 ]] || continue
+    if ! find_profile_for "${CLIENT_NAMES[$i]}" >/dev/null 2>&1; then
+      out+="${CLIENT_NAMES[$i]} "
+    fi
+  done
+  printf '%s' "${out% }"
+}
+
+# ------------------------------------------------------------------- verbs ---
+cmd_up() {
+  validate_config
+  resolve_wan
+  resolve_endpoint
+  have wg || warn "wireguard-tools not installed - install it (apt install wireguard-tools) before a real bring-up"
+
+  # Reuse the existing config's server key and peers unless --fresh was asked for. Re-running
+  # `up` must not re-key every client: a client that already imported its profile would be
+  # kicked off the tunnel and have to be re-imported. Silently breaking a working device is
+  # the one thing a repeat run must not do.
+  local conf existing_peers="" existing_priv=""
+  conf="$(server_conf_path)"
+  if [[ "$FRESH" == 0 && -r "$conf" ]]; then
+    existing_priv="$(conf_interface_privkey "$conf" || true)"
+    existing_peers="$(conf_peers "$conf")"
+  fi
+
+  if [[ -n "$existing_priv" ]]; then
+    SERVER_PRIVKEY="$existing_priv"
+    SERVER_PUBKEY="$(gen_pubkey "$existing_priv")"
+    log "reusing the server key from $conf and $(printf '%s\n' "$existing_peers" | grep -c .) existing peer(s)"
+  else
+    SERVER_PRIVKEY="$(gen_privkey)"
+    SERVER_PUBKEY="$(gen_pubkey "$SERVER_PRIVKEY")"
+    if [[ "$FRESH" == 1 && -e "$conf" ]]; then
+      warn "--fresh: regenerating every key; profiles already imported on a device will stop working"
+    fi
+  fi
+
+  build_clients "$CLIENT_COUNT" "$existing_peers"
+
+  if [[ "$PRINT_CONFIG" == 1 ]]; then
+    render_server_conf
+    local i
+    for i in "${!CLIENT_NAMES[@]}"; do
+      printf '\n'
+      render_client_conf "${CLIENT_ADDRS[$i]}" "${CLIENT_PRIVKEYS[$i]}"
+    done
+    return 0
+  fi
+
+  if [[ "$PRINT_RULES" == 1 ]]; then
+    if [[ "$HOST_OS" == Darwin ]]; then
+      local real
+      real="$(live_wg_iface "$IFACE")" || die 'Run this against an active macOS session to resolve its utun.' 1
+      render_pf "$real"
+    else
+      render_nft
+    fi
+    return 0
+  fi
+
+  # Reachability is reported for the modes that will actually advertise this endpoint. The print
+  # modes stay silent: their stdout IS the artifact (a ruleset is fed straight to `nft -f`, a
+  # profile to qrencode), and a diagnostic there is noise in somebody's config file.
+  if [[ "$ENDPOINT_IS_LOCAL" == 1 ]]; then
+    # Not a warning: on a NATed machine this is the only address that can work, so it is stated as
+    # the choice it is, with what a cellular client would need instead.
+    log "endpoint: the main local address $ENDPOINT (this host is behind NAT)"
+    if [[ -n "$PUBLIC_CANDIDATE" ]]; then
+      log "  the client must be on this network. For a cellular client, forward UDP $LISTEN_PORT to"
+      log "  $ENDPOINT upstream and re-run with --endpoint $PUBLIC_CANDIDATE."
+    fi
+  elif is_private_ip "$ENDPOINT"; then
+    warn "endpoint $ENDPOINT is a private address: a client on cellular cannot reach it."
+    warn "Use --endpoint with the address the client can dial (or keep the client on this LAN)."
+  elif endpoint_behind_nat "$ENDPOINT"; then
+    # An explicitly chosen address this host does not hold: the operator asked for it, so say what
+    # it requires rather than quietly accepting a profile that cannot connect.
+    warn "endpoint $ENDPOINT is not an address this host holds, so this machine is behind NAT."
+    warn "  the client reaches whatever NATs for it: the handshake arrives only if UDP $LISTEN_PORT is"
+    warn "  forwarded to $(nat_target_hint) upstream, or the client is on this LAN and you pass"
+    warn "  --endpoint $(nat_target_hint). Behind CGNAT there is no forward to add - see '$PROG doctor'."
+  fi
+
+  # A dynamic public address silently breaks a profile that was already imported and scanned.
+  local prev_ep=""
+  if [[ -r "$(state_file)" ]]; then
+    prev_ep="$(state_get ENDPOINT "$(state_file)" || true)"
+  fi
+  if [[ -n "$prev_ep" && "$prev_ep" != "$ENDPOINT" ]]; then
+    warn "the endpoint changed since the last session: $prev_ep -> $ENDPOINT"
+    warn "  a device that imported the old profile keeps dialling $prev_ep - re-send it: $PROG qr <name>"
+  fi
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    if [[ "$HOST_OS" == Darwin ]]; then
+      printf 'DRY RUN: %s via %s, endpoint %s:%s, PF anchor %s, proxy mode %s\n' \
+        "$IFACE" "$WAN_IFACE" "$ENDPOINT" "$LISTEN_PORT" "$(pf_anchor)" "$PROXY_MODE"
+      printf 'WireGuard assigns the utun during bring-up. No files or network settings changed.\n'
+    else
+      print_plan
+    fi
+    return 0
+  fi
+
+  apply_up
+}
+
+cmd_down() {
+  apply_down
+}
+
+cmd_status() {
+  local real
+  printf '%s%s%s\n' "$C_BOLD" "$PROG $WGB_VERSION - status" "$C_RESET"
+
+  printf '\nINTERFACE %s\n' "$IFACE"
+  if real="$(live_wg_iface "$IFACE")"; then
+    printf '  present\n'
+    if [[ "$(id -u)" == 0 ]] && have wg; then
+      wg show "$real" | sed 's/^/  /' || true
+    else
+      printf '  ..   re-run with sudo to read peers and handshakes\n'
+    fi
+  else
+    printf '  absent - the tunnel is not up\n'
+  fi
+
+  if [[ "$HOST_OS" == Darwin ]]; then
+    printf '\nRULES (PF anchor %s)\n' "$(pf_anchor)"
+    if (( EUID == 0 )); then pf -a "$(pf_anchor)" -s nat; else printf '  Re-run with sudo to inspect PF.\n'; fi
+  elif have nft && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    printf '\nRULES (table inet %s)\n' "$NFT_TABLE"
+    nft list table inet "$NFT_TABLE" | sed 's/^/  /'
+  else
+    printf '\nRULES (table inet %s)\n  absent\n' "$NFT_TABLE"
+  fi
+
+  proxy_bind_report || true
+
+  if [[ "$HOST_OS" == Darwin ]]; then
+    printf '\nFORWARDING\n  net.inet.ip.forwarding = %s\n' "$(current_ip_forward)"
+  else
+    printf '\nFORWARDING\n  net.ipv4.ip_forward = %s\n' "$(current_ip_forward)"
+  fi
+
+  printf '\nSESSION STATE\n'
+  if [[ -r "$(state_file)" ]]; then
+    printf '  %s\n' "$(state_file)"
+    sed 's/^/    /' "$(state_file)"
+  else
+    printf '  none (%s tracks nothing right now)\n' "$PROG"
+  fi
+}
+
+# ------------------------------------------------------------ arg parsing ---
+need_value() { [[ -n "${2:-}" ]] || die "$1 needs a value" 2; }
+
+# Checked at parse time so every verb refuses a relative directory immediately, not just the two
+# that happen to call validate_config.
+set_config_dir() {
+  WG_ETC_DIR="$1"
+  CONF_DIR_SET=1
+  [[ "$WG_ETC_DIR" == /* ]] ||
+    die "the config directory must be an absolute path (got: $WG_ETC_DIR); a relative one breaks 'wgb down' from another directory" 2
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      -h | --help) CMD="help"; shift ;;
+      --version) CMD="version"; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --print-config) PRINT_CONFIG=1; shift ;;
+      --print-rules) PRINT_RULES=1; shift ;;
+      --no-proxy) PROXY_MODE=0; shift ;;
+      --allow-quic) BLOCK_QUIC=0; shift ;;
+      --no-fix-firewall) FIX_FIREWALL=0; shift ;;
+      --fresh) FRESH=1; shift ;;
+      --purge) PURGE=1; shift ;;
+      --png) QR_PNG=1; shift ;;
+      --clients) need_value "$1" "${2:-}"; CLIENT_COUNT="$2"; shift 2 ;;
+      --burp-port) need_value "$1" "${2:-}"; BURP_PORT="$2"; shift 2 ;;
+      --listen-port) need_value "$1" "${2:-}"; LISTEN_PORT="$2"; shift 2 ;;
+      --dns) need_value "$1" "${2:-}"; DNS="$2"; shift 2 ;;
+      --mtu) need_value "$1" "${2:-}"; MTU="$2"; shift 2 ;;
+      --endpoint) need_value "$1" "${2:-}"; ENDPOINT="$2"; shift 2 ;;
+      --wan) need_value "$1" "${2:-}"; WAN_IFACE="$2"; shift 2 ;;
+      --iface) need_value "$1" "${2:-}"; IFACE="$2"; IFACE_SET=1; shift 2 ;;
+      --config-dir) need_value "$1" "${2:-}"; set_config_dir "$2"; shift 2 ;;
+      --subnet) need_value "$1" "${2:-}"; SUBNET="$2"; shift 2 ;;
+      --timeout) need_value "$1" "${2:-}"; WAIT_TIMEOUT="$2"; shift 2 ;;
+      --clients=*) CLIENT_COUNT="${1#*=}"; shift ;;
+      --burp-port=*) BURP_PORT="${1#*=}"; shift ;;
+      --listen-port=*) LISTEN_PORT="${1#*=}"; shift ;;
+      --dns=*) DNS="${1#*=}"; shift ;;
+      --mtu=*) MTU="${1#*=}"; shift ;;
+      --endpoint=*) ENDPOINT="${1#*=}"; shift ;;
+      --wan=*) WAN_IFACE="${1#*=}"; shift ;;
+      --iface=*) IFACE="${1#*=}"; IFACE_SET=1; shift ;;
+      --config-dir=*) set_config_dir "${1#*=}"; shift ;;
+      --subnet=*) SUBNET="${1#*=}"; shift ;;
+      --timeout=*) WAIT_TIMEOUT="${1#*=}"; shift ;;
+      --) shift; EXTRA+=("$@"); break ;;
+      -*) die "unknown option: $1 (try --help)" 2 ;;
+      *) if [[ -z "$CMD" ]]; then CMD="$1"; else EXTRA+=("$1"); fi; shift ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$HOST_OS" == Darwin ]]; then
+    if [[ -z "$STATE_DIR" ]]; then
+      STATE_DIR="$(darwin_default_state_dir)" || die 'Cannot determine the macOS boot session for the state directory.' 1
+    fi
+    case "$CMD" in
+      up|down|add-client|remove-client)
+        (( BASH_VERSINFO[0] >= 4 )) || die 'macOS requires Bash 4+; see docs/macos.md.' 1
+        if [[ "$CMD" != up || "$DRY_RUN$PRINT_RULES$PRINT_CONFIG" == 000 ]]; then
+          ensure_root
+          trusted_root_path "$STATE_DIR" || die 'macOS session path must be root-owned and not group/world-writable.' 1
+          ( umask 077; ensure_state_dir ) || die 'Cannot prepare macOS session directory.' 1
+          mkdir "$STATE_DIR/.lock" 2>/dev/null || die 'macOS session is locked; see docs/macos.md.' 1
+          trap 'rmdir "$STATE_DIR/.lock" 2>/dev/null || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+        fi ;;
+    esac
+  fi
+  # Every verb but help/version works on the session's interface when the caller did not
+  # name one, and adopts the paths that session recorded.
+  adopt_session
+  if [[ "$HOST_OS" == Darwin ]]; then
+    is_iface_name "$IFACE" || die "invalid --iface: $IFACE" 2
+    case "$CMD" in
+      up|down|add-client|remove-client)
+        if ! trusted_root_path "$WG_ETC_DIR" || ! trusted_root_path "$(server_conf_path)"; then
+          die 'macOS WireGuard configs and their directories must be root-owned and not group/world-writable.' 1
+        fi ;;
+    esac
+  fi
+  case "${CMD:-help}" in
+    help) usage ;;
+    version) printf '%s %s\n' "$PROG" "$WGB_VERSION" ;;
+    up) cmd_up ;;
+    doctor) cmd_doctor ;;
+    down) cmd_down ;;
+    status) cmd_status ;;
+    list) cmd_list ;;
+    add-client) cmd_add_client ;;
+    remove-client) cmd_remove_client ;;
+    qr) cmd_qr ;;
+    wait) cmd_wait ;;
+    ca) cmd_ca ;;
+    *) die "unknown command: $CMD (try --help)" 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos-pf-syntax:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check candidate PF rules without applying them
+        run: bash test/macos-pf-check.sh
+
+  macos-wireguard-lifecycle:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WireGuard tools
+        run: brew install wireguard-tools
+      - name: Exercise a disposable tunnel without loading PF rules
+        run: |
+          brew_bin="$(brew --prefix)/bin"
+          sudo -n /usr/bin/env PATH="$brew_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            "$brew_bin/bash" test/macos-wireguard-check.sh
+
+  macos-pf-delivery:
+    runs-on: macos-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: test/fixtures/wg-http/go.sum
+      - name: Install WireGuard tools
+        run: brew install wireguard-tools
+      - name: Build isolated WireGuard HTTP peer
+        working-directory: test/fixtures/wg-http
+        run: go build -mod=readonly -o "$RUNNER_TEMP/wgb-wg-http" .
+      - name: Verify live PF delivery and cleanup on a disposable runner
+        run: |
+          brew_bin="$(brew --prefix)/bin"
+          sudo -n /usr/bin/env PATH="$brew_bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            "$brew_bin/bash" test/macos-pf-delivery-check.sh "$RUNNER_TEMP/wgb-wg-http"

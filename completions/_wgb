@@ -1,0 +1,140 @@
+#compdef wgb
+#
+# zsh completion for wgb - the verbs, their flags, and the values this machine can answer for.
+#
+# install.sh installs this to <prefix>/share/zsh/site-functions/_wgb. zsh loads a completion only from
+# a directory on its fpath, and the one for locally installed tools is
+# /usr/local/share/zsh/site-functions - which is on Debian's default fpath, unlike
+# /usr/share/zsh/site-functions. The installer checks this and says so when the file would need a
+# line in your ~/.zshrc:
+#   fpath=(/usr/local/share/zsh/site-functions $fpath)      # BEFORE compinit runs
+#
+# The tool's parser accepts any flag after any verb; what is offered here is the set that means
+# something for that verb (the tool documents --iface and --config-dir for every session verb, since
+# they all adopt the running session unless the caller names one).
+#
+# Client NAMES are deliberately not completed. The profiles hold private keys and the server config is
+# root-only, so an unprivileged completion would either fail or expose what is in them.
+
+# Interfaces on this machine: the values --iface and --wan take.
+_wgb_iface_names() {
+  local -a ifaces
+  ifaces=(${(f)"$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)"})
+  compadd -- "${ifaces[@]}"
+}
+
+_wgb() {
+  local context state state_descr line
+  typeset -A opt_args
+  local ret=1
+
+  local -a verbs
+  verbs=(
+    'up:bring the tunnel and interception rules up'
+    'down:tear everything down (atomic)'
+    'status:tunnel, rules, and handshake state'
+    'doctor:read-only preflight of this machine'
+    'list:peers, addresses, last handshake'
+    'add-client:add a peer at the lowest free address'
+    'remove-client:remove a peer'
+    'qr:print an importable QR for a client profile'
+    'wait:block until a handshake lands, then report ready'
+    'ca:how to get the Burp CA trusted on the client'
+    'version:print the version'
+    'help:print the usage text'
+  )
+
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[print the usage text]' \
+    '--version[print the version]' \
+    '1: :->verb' \
+    '*:: :->args' && ret=0
+
+  case $state in
+    verb)
+      _describe -t verbs 'wgb verb' verbs && ret=0
+      ;;
+    args)
+      case $words[1] in
+        up)
+          _arguments \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--subnet[tunnel subnet, must be /24]:subnet:' \
+            '--listen-port[WireGuard UDP port]:port:' \
+            '--burp-port[interception listener port]:port:' \
+            '--dns[client DNS resolver]:resolver:(1.1.1.1 8.8.8.8 9.9.9.9 10.0.0.1)' \
+            '--mtu[tunnel MTU]:mtu:(1280 1300 1380 1420 1500)' \
+            '--endpoint[address the client dials]:host:' \
+            '--wan[outbound interface]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '--clients[number of client profiles]:count:(1 2 3 4 5)' \
+            '--no-proxy[tunnel only, no TCP redirect to Burp]' \
+            '--allow-quic[do not block UDP 443 (QUIC will bypass the proxy)]' \
+            '--no-fix-firewall[report a ufw drop instead of adding the route rule]' \
+            '--fresh[regenerate every key]' \
+            '--dry-run[print the full plan, change nothing]' \
+            '--print-config[print the server and client configs to stdout]' \
+            '--print-rules[print the nftables ruleset to stdout]' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        down)
+          _arguments \
+            '--purge[also remove config, state and profiles]' \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        qr)
+          _arguments \
+            '--png[write a PNG beside the profile]' \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '1:client name:' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        wait)
+          _arguments \
+            '--timeout[seconds to wait]:seconds:(30 60 120 300)' \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        doctor)
+          _arguments \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '--endpoint[address a client would dial]:host:' \
+            '--wan[outbound interface]:interface:_wgb_iface_names' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        add-client|remove-client)
+          _arguments \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '1:client name:' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        status|list|ca)
+          _arguments \
+            '--iface[interface name]:interface:_wgb_iface_names' \
+            '--config-dir[absolute directory for the server config]:directory:_directories' \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+        *)
+          _arguments \
+            '(-h --help)'{-h,--help}'[print the usage text]' \
+            '--version[print the version]' && ret=0
+          ;;
+      esac
+      ;;
+  esac
+
+  return ret
+}

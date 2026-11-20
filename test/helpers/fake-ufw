@@ -1,0 +1,47 @@
+#!/bin/sh
+# A stand-in for ufw, for the test suites and for hosts without ufw installed.
+#
+# It answers the three things the tool asks: whether ufw is active, what its policies are, and
+# whether the tunnel subnet is already allowed - and it records every invocation so a test can assert
+# what the tool did (and did not) ask it to change.
+#
+# State lives under $UFW_FAKE_DIR:
+#   rules  - one "ALLOW FWD <subnet>" line per rule, printed by `status` (mimics ufw's listing)
+#   calls  - every invocation, appended by this script
+set -u
+dir=${UFW_FAKE_DIR:?fake ufw needs UFW_FAKE_DIR}
+
+printf '%s\n' "$*" >>"$dir/calls"
+
+case "$1 ${2:-}" in
+  "status verbose")
+    if [ -f "$dir/inactive" ]; then printf 'Status: inactive\n'; exit 0; fi
+    printf 'Status: active\n'
+    printf 'Logging: on (low)\n'
+    printf 'Default: deny (incoming), allow (outgoing), disabled (routed)\n'
+    if [ -f "$dir/rules" ]; then cat "$dir/rules"; fi
+    ;;
+  "status "*)
+    if [ -f "$dir/inactive" ]; then printf 'Status: inactive\n'; exit 0; fi
+    printf 'Status: active\n'
+    if [ -f "$dir/rules" ]; then cat "$dir/rules"; fi
+    ;;
+  "route allow")
+    # ufw route allow from <subnet>
+    printf 'ALLOW FWD %s\n' "${4:-}" >>"$dir/rules"
+    ;;
+  "route delete")
+    # ufw route delete allow from <subnet>  (ufw's own route form; `ufw delete route ...` is rejected)
+    if [ -f "$dir/rules" ]; then
+      awk -v want="${5:-}" 'BEGIN { dropped = 0 }
+        { if (!dropped && index($0, want) > 0) { dropped = 1; next } print }' \
+        "$dir/rules" >"$dir/rules.tmp"
+      mv "$dir/rules.tmp" "$dir/rules"
+    fi
+    ;;
+  *)
+    printf 'fake ufw: unhandled invocation: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+exit 0
